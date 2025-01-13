@@ -21,12 +21,12 @@ import org.apache.hudi.client.BaseCompactor;
 import org.apache.hudi.client.BaseHoodieWriteClient;
 import org.apache.hudi.common.engine.EngineProperty;
 import org.apache.hudi.common.engine.HoodieEngineContext;
-import org.apache.hudi.common.table.timeline.HoodieInstant;
+import org.apache.hudi.common.util.CustomizedThreadFactory;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.exception.HoodieIOException;
 
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
@@ -39,17 +39,15 @@ import java.util.stream.IntStream;
  */
 public abstract class AsyncCompactService extends HoodieAsyncTableService {
 
-  private static final long serialVersionUID = 1L;
-  private static final Logger LOG = LogManager.getLogger(AsyncCompactService.class);
-
   /**
    * This is the job pool used by async compaction.
    */
   public static final String COMPACT_POOL_NAME = "hoodiecompact";
-
+  private static final long serialVersionUID = 1L;
+  private static final Logger LOG = LoggerFactory.getLogger(AsyncCompactService.class);
   private final int maxConcurrentCompaction;
-  private transient BaseCompactor compactor;
   protected transient HoodieEngineContext context;
+  private transient BaseCompactor compactor;
 
   public AsyncCompactService(HoodieEngineContext context, BaseHoodieWriteClient client) {
     this(context, client, false);
@@ -70,11 +68,7 @@ public abstract class AsyncCompactService extends HoodieAsyncTableService {
   @Override
   protected Pair<CompletableFuture, ExecutorService> startService() {
     ExecutorService executor = Executors.newFixedThreadPool(maxConcurrentCompaction,
-        r -> {
-        Thread t = new Thread(r, "async_compact_thread");
-        t.setDaemon(isRunInDaemonMode());
-        return t;
-      });
+        new CustomizedThreadFactory("async_compact_thread", isRunInDaemonMode()));
     return Pair.of(CompletableFuture.allOf(IntStream.range(0, maxConcurrentCompaction).mapToObj(i -> CompletableFuture.supplyAsync(() -> {
       try {
         // Set Compactor Pool Name for allowing users to prioritize compaction
@@ -82,12 +76,12 @@ public abstract class AsyncCompactService extends HoodieAsyncTableService {
         context.setProperty(EngineProperty.COMPACTION_POOL_NAME, COMPACT_POOL_NAME);
 
         while (!isShutdownRequested()) {
-          final HoodieInstant instant = fetchNextAsyncServiceInstant();
+          final String instantTime = fetchNextAsyncServiceInstant();
 
-          if (null != instant) {
-            LOG.info("Starting Compaction for instant " + instant);
-            compactor.compact(instant);
-            LOG.info("Finished Compaction for instant " + instant);
+          if (null != instantTime) {
+            LOG.info("Starting Compaction for instant " + instantTime);
+            compactor.compact(instantTime);
+            LOG.info("Finished Compaction for instant " + instantTime);
           }
         }
         LOG.info("Compactor shutting down properly!!");
@@ -107,9 +101,9 @@ public abstract class AsyncCompactService extends HoodieAsyncTableService {
     }, executor)).toArray(CompletableFuture[]::new)), executor);
   }
 
-
   /**
    * Check whether compactor thread needs to be stopped.
+   *
    * @return
    */
   protected boolean shouldStopCompactor() {

@@ -18,13 +18,15 @@
 package org.apache.hudi
 
 import org.apache.hudi.config.HoodieWriteConfig
-import org.apache.hudi.testutils.HoodieClientTestBase
+import org.apache.hudi.testutils.HoodieSparkClientTestBase
+
 import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
 
 import java.sql.{Date, Timestamp}
 
-class TestGenericRecordAndRowConsistency extends HoodieClientTestBase {
+class TestGenericRecordAndRowConsistency extends HoodieSparkClientTestBase {
 
   var spark: SparkSession = _
   val commonOpts = Map(
@@ -113,6 +115,6 @@ class TestGenericRecordAndRowConsistency extends HoodieClientTestBase {
       .select("_hoodie_record_key")
       .map(_.toString()).collect().sorted
 
-    assert(data1 sameElements data2)
+    assertEquals(data1.toSeq, data2.toSeq)
   }
 }

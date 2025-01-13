@@ -18,6 +18,9 @@
 
 package org.apache.hudi.sink.bulk.sort;
 
+import org.apache.hudi.adapter.SortCodeGeneratorAdapter;
+
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.table.api.TableConfig;
 import org.apache.flink.table.data.RowData;
@@ -26,7 +29,6 @@ import org.apache.flink.table.planner.plan.nodes.exec.spec.SortSpec;
 import org.apache.flink.table.types.logical.RowType;
 
 import java.util.Arrays;
-import java.util.stream.IntStream;
 
 /**
  * Tools to generate the sort operator.
@@ -34,23 +36,26 @@ import java.util.stream.IntStream;
 public class SortOperatorGen {
   private final int[] sortIndices;
   private final RowType rowType;
-  private final TableConfig tableConfig = new TableConfig();
+  private final TableConfig tableConfig = TableConfig.getDefault();
 
   public SortOperatorGen(RowType rowType, String[] sortFields) {
     this.sortIndices = Arrays.stream(sortFields).mapToInt(rowType::getFieldIndex).toArray();
     this.rowType = rowType;
   }
 
-  public OneInputStreamOperator<RowData, RowData> createSortOperator() {
+  public OneInputStreamOperator<RowData, RowData> createSortOperator(Configuration conf) {
     SortCodeGenerator codeGen = createSortCodeGenerator();
     return new SortOperator(
         codeGen.generateNormalizedKeyComputer("SortComputer"),
-        codeGen.generateRecordComparator("SortComparator"));
+        codeGen.generateRecordComparator("SortComparator"),
+        conf);
   }
 
-  private SortCodeGenerator createSortCodeGenerator() {
+  public SortCodeGenerator createSortCodeGenerator() {
     SortSpec.SortSpecBuilder builder = SortSpec.builder();
-    IntStream.range(0, sortIndices.length).forEach(i -> builder.addField(i, true, true));
-    return new SortCodeGenerator(tableConfig, rowType, builder.build());
+    for (int sortIndex : sortIndices) {
+      builder.addField(sortIndex, true, true);
+    }
+    return new SortCodeGeneratorAdapter(tableConfig, rowType, builder.build());
   }
 }

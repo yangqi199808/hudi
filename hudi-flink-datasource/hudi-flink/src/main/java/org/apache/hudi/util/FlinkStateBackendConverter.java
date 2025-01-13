@@ -18,12 +18,13 @@
 
 package org.apache.hudi.util;
 
+import org.apache.hudi.exception.HoodieException;
+
 import com.beust.jcommander.IStringConverter;
 import com.beust.jcommander.ParameterException;
 import org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackend;
 import org.apache.flink.runtime.state.StateBackend;
 import org.apache.flink.runtime.state.hashmap.HashMapStateBackend;
-import org.apache.hudi.exception.HoodieException;
 
 /**
  * Converter that converts a string into Flink StateBackend.
@@ -32,10 +33,12 @@ public class FlinkStateBackendConverter implements IStringConverter<StateBackend
   @Override
   public StateBackend convert(String value) throws ParameterException {
     switch (value) {
-      case "hashmap" : return new HashMapStateBackend();
-      case "rocksdb" : return new EmbeddedRocksDBStateBackend();
+      case "hashmap":
+        return new HashMapStateBackend();
+      case "rocksdb":
+        return new EmbeddedRocksDBStateBackend();
       default:
-        throw new HoodieException(String.format("Unknown flink state backend %s.", value));
+        throw new HoodieException(String.format("Unknown flink state backend %s. Supports only hashmap and rocksdb by now", value));
     }
   }
 }

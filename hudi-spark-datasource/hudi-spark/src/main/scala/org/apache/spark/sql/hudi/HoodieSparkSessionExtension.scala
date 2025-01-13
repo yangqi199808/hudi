@@ -18,6 +18,7 @@
 package org.apache.spark.sql.hudi
 
 import org.apache.hudi.SparkAdapterSupport
+
 import org.apache.spark.sql.SparkSessionExtensions
 import org.apache.spark.sql.hudi.analysis.HoodieAnalysis
 import org.apache.spark.sql.parser.HoodieCommonSqlParser
@@ -28,21 +29,29 @@ import org.apache.spark.sql.parser.HoodieCommonSqlParser
 class HoodieSparkSessionExtension extends (SparkSessionExtensions => Unit)
   with SparkAdapterSupport {
   override def apply(extensions: SparkSessionExtensions): Unit = {
-
     extensions.injectParser { (session, parser) =>
       new HoodieCommonSqlParser(session, parser)
     }
 
-    HoodieAnalysis.customResolutionRules().foreach { rule =>
-      extensions.injectResolutionRule { session =>
-        rule(session)
-      }
+    HoodieAnalysis.customResolutionRules.foreach { ruleBuilder =>
+      extensions.injectResolutionRule(ruleBuilder(_))
     }
 
-    HoodieAnalysis.customPostHocResolutionRules().foreach { rule =>
-      extensions.injectPostHocResolutionRule { session =>
-        rule(session)
-      }
+    HoodieAnalysis.customPostHocResolutionRules.foreach { ruleBuilder =>
+      extensions.injectPostHocResolutionRule(ruleBuilder(_))
     }
+
+    HoodieAnalysis.customOptimizerRules.foreach { ruleBuilder =>
+      extensions.injectOptimizerRule(ruleBuilder(_))
+    }
+
+    /*
+    // CBO is only supported in Spark >= 3.1.x
+    HoodieAnalysis.customPreCBORules.foreach { ruleBuilder =>
+      extensions.injectPreCBORule(ruleBuilder(_))
+    }
+    */
+
+    sparkAdapter.injectTableFunctions(extensions)
   }
 }

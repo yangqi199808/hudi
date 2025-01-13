@@ -20,7 +20,7 @@
     <parent>
         <artifactId>hudi</artifactId>
         <groupId>org.apache.hudi</groupId>
-        <version>0.11.0-SNAPSHOT</version>
+        <version>1.1.0-SNAPSHOT</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
     <modelVersion>4.0.0</modelVersion>
@@ -30,6 +30,7 @@
     <properties>
         <checkstyle.skip>true</checkstyle.skip>
         <main.basedir>${project.parent.basedir}</main.basedir>
+        <skipTests>true</skipTests>
         <kafka.connect.bundle.shade.prefix>org.apache.hudi.</kafka.connect.bundle.shade.prefix>
     </properties>
 
@@ -58,22 +59,23 @@
                                         implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer">
                                 </transformer>
                                 <transformer
-                                        implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer">
+                                    implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer">
                                     <addHeader>true</addHeader>
                                 </transformer>
                                 <transformer
-                                        implementation="org.apache.maven.plugins.shade.resource.IncludeResourceTransformer">
+                                    implementation="org.apache.maven.plugins.shade.resource.IncludeResourceTransformer">
                                     <resource>META-INF/LICENSE</resource>
                                     <file>target/classes/META-INF/LICENSE</file>
                                 </transformer>
+                                <transformer
+                                    implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                             </transformers>
                             <artifactSet>
-                                <includes>
+                                <includes combine.children="append">
+                                    <include>org.apache.hudi:hudi-hadoop-common</include>
                                     <include>org.apache.hudi:hudi-common</include>
                                     <include>org.apache.hudi:hudi-client-common</include>
                                     <include>org.apache.hudi:hudi-java-client</include>
-                                    <include>org.apache.hudi:hudi-spark-client</include>
-                                    <include>org.apache.hudi:hudi-spark-common_${scala.binary.version}</include>
                                     <include>org.apache.hudi:hudi-kafka-connect</include>
                                     <include>org.apache.hudi:hudi-utilities_${scala.binary.version}</include>
                                     <include>org.apache.hudi:hudi-hive-sync</include>
@@ -83,14 +85,30 @@
                                     <include>org.apache.hudi:hudi-aws</include>
 
                                     <!-- NOTE: This is temp (SchemaProvide dep) until PR3162 lands -->
-                                    <include>org.apache.hudi:hudi-flink_${scala.binary.version}</include>
+                                    <include>org.apache.hudi:hudi-flink</include>
                                     <include>org.apache.hudi:flink-core</include>
                                     <include>org.apache.hudi:hudi-flink-client</include>
                                     <include>org.apache.flink:flink-core</include>
-                                    <include>org.apache.flink:flink-hadoop-compatibility_${scala.binary.version}</include>
+                                    <include>${flink.hadoop.compatibility.artifactId}</include>
 
+                                    <!-- Kryo -->
+                                    <include>com.esotericsoftware:kryo-shaded</include>
+                                    <include>com.esotericsoftware:minlog</include>
+                                    <include>org.objenesis:objenesis</include>
+
+                                    <!-- Jackson
+                                         NOTE: Even though Hive bundles Jackson, it doesn't bundle JSR310 module (unlike Spark).
+                                               Therefore, to make sure that JSR310 is compatible w/ the Jackson core used by Hudi, we bundle the core
+                                               as well, while shading it -->
+                                    <include>com.fasterxml.jackson.core:jackson-annotations</include>
+                                    <include>com.fasterxml.jackson.core:jackson-core</include>
+                                    <include>com.fasterxml.jackson.core:jackson-databind</include>
+                                    <include>com.fasterxml.jackson.datatype:jackson-datatype-jsr310</include>
+
+                                    <include>com.lmax:disruptor</include>
                                     <include>com.github.davidmoten:guava-mini</include>
                                     <include>com.github.davidmoten:hilbert-curve</include>
+                                    <include>com.github.ben-manes.caffeine:caffeine</include>
                                     <include>com.yammer.metrics:metrics-core</include>
                                     <include>com.beust:jcommander</include>
                                     <include>io.javalin:javalin</include>
@@ -98,9 +116,6 @@
                                     <include>org.eclipse.jetty:*</include>
                                     <include>org.eclipse.jetty.websocket:*</include>
                                     <include>org.rocksdb:rocksdbjni</include>
-                                    <include>org.apache.httpcomponents:httpclient</include>
-                                    <include>org.apache.httpcomponents:httpcore</include>
-                                    <include>org.apache.httpcomponents:fluent-hc</include>
 
                                     <include>io.dropwizard.metrics:metrics-core</include>
                                     <include>io.dropwizard.metrics:metrics-graphite</include>
@@ -110,36 +125,68 @@
                                     <include>io.prometheus:simpleclient_dropwizard</include>
                                     <include>io.prometheus:simpleclient_pushgateway</include>
                                     <include>io.prometheus:simpleclient_common</include>
-                                    <include>com.yammer.metrics:metrics-core</include>
+                                    <include>com.uber.m3:tally-m3</include>
+                                    <include>com.uber.m3:tally-core</include>
                                     <include>com.google.protobuf:protobuf-java</include>
-                                    <include>org.objenesis:objenesis</include>
-                                    <include>com.esotericsoftware:kryo-shaded</include>
-                                    <include>com.esotericsoftware:minlog</include>
-                                    
-                                    <include>org.apache.hbase:hbase-client</include>
-                                    <include>org.apache.hbase:hbase-common</include>
-                                    <include>org.apache.hbase:hbase-protocol</include>
-                                    <include>org.apache.hbase:hbase-server</include>
-                                    <include>org.apache.htrace:htrace-core</include>
+
                                     <include>org.scala-lang:*</include>
+                                    <include>commons-io:commons-io</include>
+                                    <include>org.openjdk.jol:jol-core</include>
                                 </includes>
                             </artifactSet>
-                            <relocations>
+                            <relocations combine.children="append">
+                                <!-- Kryo -->
+                                <relocation>
+                                    <pattern>com.esotericsoftware.kryo.</pattern>
+                                    <shadedPattern>org.apache.hudi.com.esotericsoftware.kryo.</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.esotericsoftware.reflectasm.</pattern>
+                                    <shadedPattern>org.apache.hudi.com.esotericsoftware.reflectasm.</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.esotericsoftware.minlog.</pattern>
+                                    <shadedPattern>org.apache.hudi.com.esotericsoftware.minlog.</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.objenesis.</pattern>
+                                    <shadedPattern>org.apache.hudi.org.objenesis.</shadedPattern>
+                                </relocation>
+
                                 <relocation>
                                     <pattern>com.google.protobuf.</pattern>
                                     <shadedPattern>${kafka.connect.bundle.shade.prefix}com.google.protobuf.</shadedPattern>
                                 </relocation>
                                 <relocation>
                                     <pattern>com.yammer.metrics.</pattern>
-                                    <shadedPattern>${kafka.connect.bundle.shade.prefix}com.yammer.metrics.</shadedPattern>
+                                    <shadedPattern>${kafka.connect.bundle.shade.prefix}com.yammer.metrics.
+                                    </shadedPattern>
                                 </relocation>
                                 <relocation>
                                     <pattern>com.beust.jcommander.</pattern>
-                                    <shadedPattern>${kafka.connect.bundle.shade.prefix}com.beust.jcommander.</shadedPattern>
+                                    <shadedPattern>${kafka.connect.bundle.shade.prefix}com.beust.jcommander.
+                                    </shadedPattern>
                                 </relocation>
                                 <relocation>
                                     <pattern>org.eclipse.jetty.</pattern>
-                                    <shadedPattern>${kafka.connect.bundle.shade.prefix}org.eclipse.jetty.</shadedPattern>
+                                    <shadedPattern>${kafka.connect.bundle.shade.prefix}org.eclipse.jetty.
+                                    </shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.apache.commons.io.</pattern>
+                                    <shadedPattern>org.apache.hudi.org.apache.commons.io.</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>org.openjdk.jol.</pattern>
+                                    <shadedPattern>org.apache.hudi.org.openjdk.jol.</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.fasterxml.jackson.</pattern>
+                                    <shadedPattern>org.apache.hudi.com.fasterxml.jackson.</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.uber.m3.</pattern>
+                                    <shadedPattern>org.apache.hudi.com.uber.m3.</shadedPattern>
                                 </relocation>
                             </relocations>
                             <filters>
@@ -150,6 +197,8 @@
                                         <exclude>META-INF/*.DSA</exclude>
                                         <exclude>META-INF/*.RSA</exclude>
                                         <exclude>META-INF/services/javax.*</exclude>
+                                        <exclude>**/*.proto</exclude>
+                                        <exclude>hbase-webapps/**</exclude>
                                     </excludes>
                                 </filter>
                             </filters>
@@ -163,9 +212,6 @@
             <resource>
                 <directory>src/main/resources</directory>
             </resource>
-            <resource>
-                <directory>src/test/resources</directory>
-            </resource>
         </resources>
     </build>
 
@@ -176,12 +222,6 @@
             <artifactId>hudi-kafka-connect</artifactId>
             <version>${project.version}</version>
             <scope>compile</scope>
-            <exclusions>
-                <exclusion>
-                    <groupId>log4j</groupId>
-                    <artifactId>log4j</artifactId>
-                </exclusion>
-            </exclusions>
         </dependency>
         <dependency>
             <groupId>org.apache.hudi</groupId>
@@ -223,10 +263,13 @@
                 </exclusion>
             </exclusions>
         </dependency>
+
+        <!-- Kryo -->
         <dependency>
-            <groupId>org.apache.hudi</groupId>
-            <artifactId>hudi-spark-common_${scala.binary.version}</artifactId>
-            <version>${project.version}</version>
+            <groupId>com.esotericsoftware</groupId>
+            <artifactId>kryo-shaded</artifactId>
+            <version>${kryo.shaded.version}</version>
+            <scope>compile</scope>
         </dependency>
 
         <!-- Avro/ Parquet -->
@@ -320,13 +363,6 @@
             <artifactId>hive-common</artifactId>
             <version>${hive.version}</version>
             <scope>${utilities.bundle.hive.scope}</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>org.apache.htrace</groupId>
-            <artifactId>htrace-core</artifactId>
-            <version>${htrace.version}</version>
-            <scope>compile</scope>
         </dependency>
 
     </dependencies>

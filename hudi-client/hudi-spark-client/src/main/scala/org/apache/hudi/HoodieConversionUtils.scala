@@ -18,7 +18,21 @@
 
 package org.apache.hudi
 
+import org.apache.hudi.common.config.TypedProperties
+
+import java.{util => ju}
+
+import scala.collection.JavaConverters._
+
 object HoodieConversionUtils {
+
+  /**
+   * Converts Java's [[ju.Map]] into Scala's (immutable) [[Map]] (by default [[JavaConverters]] convert to
+   * a mutable one)
+   */
+  def mapAsScalaImmutableMap[K, V](map: ju.Map[K, V]): Map[K, V] = {
+    map.asScala.toMap
+  }
 
   def toJavaOption[T](opt: Option[T]): org.apache.hudi.common.util.Option[T] =
     if (opt.isDefined) org.apache.hudi.common.util.Option.of(opt.get) else org.apache.hudi.common.util.Option.empty()
@@ -26,4 +40,15 @@ object HoodieConversionUtils {
   def toScalaOption[T](opt: org.apache.hudi.common.util.Option[T]): Option[T] =
     if (opt.isPresent) Some(opt.get) else None
 
+  def toProperties(params: Map[String, String]): TypedProperties = {
+    val props = new TypedProperties()
+    params.foreach(kv => props.setProperty(kv._1, kv._2))
+    props
+  }
+
+  def fromProperties(props: TypedProperties): Map[String, String] = {
+    props.asScala.map {
+      case (k, v) => (k.toString, v.toString)
+    }.toMap
+  }
 }

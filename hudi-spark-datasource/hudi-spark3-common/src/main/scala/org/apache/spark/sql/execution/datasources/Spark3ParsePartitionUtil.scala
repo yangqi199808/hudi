@@ -17,57 +17,60 @@
 
 package org.apache.spark.sql.execution.datasources
 
-import java.lang.{Double => JDouble, Long => JLong}
-import java.math.{BigDecimal => JBigDecimal}
-import java.time.ZoneId
-import java.util.{Locale, TimeZone}
-
 import org.apache.hadoop.fs.Path
-
 import org.apache.hudi.common.util.PartitionPathEncodeUtils.DEFAULT_PARTITION_PATH
 import org.apache.hudi.spark3.internal.ReflectUtil
-
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.catalog.ExternalCatalogUtils.unescapePathName
 import org.apache.spark.sql.catalyst.expressions.{Cast, Literal}
 import org.apache.spark.sql.catalyst.util.{DateFormatter, TimestampFormatter}
 import org.apache.spark.sql.execution.datasources.PartitioningUtils.timestampPartitionPattern
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
+
+import java.lang.{Double => JDouble, Long => JLong}
+import java.math.{BigDecimal => JBigDecimal}
+import java.time.ZoneId
+import java.util.{Locale, TimeZone}
+import java.util.concurrent.ConcurrentHashMap
 
 import scala.collection.mutable.ArrayBuffer
 import scala.util.Try
 import scala.util.control.NonFatal
 
-class Spark3ParsePartitionUtil(conf: SQLConf) extends SparkParsePartitionUtil {
+object Spark3ParsePartitionUtil extends SparkParsePartitionUtil {
+
+  private val cache = new ConcurrentHashMap[ZoneId, (DateFormatter, TimestampFormatter)](1)
 
   /**
    * The definition of PartitionValues has been changed by SPARK-34314 in Spark3.2.
    * To solve the compatibility between 3.1 and 3.2, copy some codes from PartitioningUtils in Spark3.2 here.
    * And this method will generate and return `InternalRow` directly instead of `PartitionValues`.
    */
-  override def parsePartition(
-      path: Path,
-      typeInference: Boolean,
-      basePaths: Set[Path],
-      userSpecifiedDataTypes: Map[String, DataType],
-      timeZone: TimeZone): InternalRow = {
-    val dateFormatter = ReflectUtil.getDateFormatter(timeZone.toZoneId)
-    val timestampFormatter = TimestampFormatter(timestampPartitionPattern,
-      timeZone.toZoneId, isParsing = true)
+  override def parsePartition(path: Path,
+                              typeInference: Boolean,
+                              basePaths: Set[Path],
+                              userSpecifiedDataTypes: Map[String, DataType],
+                              tz: TimeZone,
+                              validatePartitionValues: Boolean = false): InternalRow = {
+    val (dateFormatter, timestampFormatter) = cache.computeIfAbsent(tz.toZoneId, zoneId => {
+      val dateFormatter = ReflectUtil.getDateFormatter(zoneId)
+      val timestampFormatter = TimestampFormatter(timestampPartitionPattern, zoneId, isParsing = true)
+
+      (dateFormatter, timestampFormatter)
+    })
 
     val (partitionValues, _) = parsePartition(path, typeInference, basePaths, userSpecifiedDataTypes,
-      conf.validatePartitionColumns, timeZone.toZoneId, dateFormatter, timestampFormatter)
+      validatePartitionValues, tz.toZoneId, dateFormatter, timestampFormatter)
 
     partitionValues.map {
       case PartitionValues(columnNames: Seq[String], typedValues: Seq[TypedPartValue]) =>
         val rowValues = columnNames.zip(typedValues).map { case (columnName, typedValue) =>
           try {
-            castPartValueToDesiredType(typedValue.dataType, typedValue.value, timeZone.toZoneId)
+            castPartValueToDesiredType(typedValue.dataType, typedValue.value, tz.toZoneId)
           } catch {
             case NonFatal(_) =>
-              if (conf.validatePartitionColumns) {
+              if (validatePartitionValues) {
                 throw new RuntimeException(s"Failed to cast value `${typedValue.value}` to " +
                   s"`${typedValue.dataType}` for partition column `$columnName`")
               } else null
@@ -143,7 +146,7 @@ class Spark3ParsePartitionUtil(conf: SQLConf) extends SparkParsePartitionUtil {
       (None, Some(path))
     } else {
       val (columnNames, values) = columns.reverse.unzip
-      (Some(PartitionValues(columnNames, values)), Some(currentPath))
+      (Some(PartitionValues(columnNames.toSeq, values.toSeq)), Some(currentPath))
     }
   }
 
@@ -254,8 +257,11 @@ class Spark3ParsePartitionUtil(conf: SQLConf) extends SparkParsePartitionUtil {
     case _ if value == DEFAULT_PARTITION_PATH => null
     case NullType => null
     case StringType => UTF8String.fromString(unescapePathName(value))
+    case ByteType => Integer.parseInt(value).toByte
+    case ShortType => Integer.parseInt(value).toShort
     case IntegerType => Integer.parseInt(value)
     case LongType => JLong.parseLong(value)
+    case FloatType => JDouble.parseDouble(value).toFloat
     case DoubleType => JDouble.parseDouble(value)
     case _: DecimalType => Literal(new JBigDecimal(value)).value
     case DateType =>
@@ -267,6 +273,8 @@ class Spark3ParsePartitionUtil(conf: SQLConf) extends SparkParsePartitionUtil {
       }.getOrElse {
         Cast(Cast(Literal(value), DateType, Some(zoneId.getId)), dt).eval()
       }
+    case BinaryType => value.getBytes()
+    case BooleanType => value.toBoolean
     case dt => throw new IllegalArgumentException(s"Unexpected type $dt")
   }
 

@@ -21,22 +21,20 @@ package org.apache.hudi.client;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
-import org.apache.hudi.common.model.HoodieRecordPayload;
 import org.apache.hudi.common.model.HoodieWriteStat;
-import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.table.action.HoodieWriteMetadata;
 
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
 import org.apache.spark.api.java.JavaRDD;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 
-public class HoodieSparkCompactor<T extends HoodieRecordPayload> extends BaseCompactor<T,
+public class HoodieSparkCompactor<T> extends BaseCompactor<T,
     JavaRDD<HoodieRecord<T>>, JavaRDD<HoodieKey>, JavaRDD<WriteStatus>> {
-  private static final Logger LOG = LogManager.getLogger(HoodieSparkCompactor.class);
+  private static final Logger LOG = LoggerFactory.getLogger(HoodieSparkCompactor.class);
   private transient HoodieEngineContext context;
 
   public HoodieSparkCompactor(BaseHoodieWriteClient<T, JavaRDD<HoodieRecord<T>>, JavaRDD<HoodieKey>, JavaRDD<WriteStatus>> compactionClient,
@@ -46,19 +44,19 @@ public class HoodieSparkCompactor<T extends HoodieRecordPayload> extends BaseCom
   }
 
   @Override
-  public void compact(HoodieInstant instant) {
-    LOG.info("Compactor executing compaction " + instant);
+  public void compact(String instantTime) {
+    LOG.info("Compactor executing compaction " + instantTime);
     SparkRDDWriteClient<T> writeClient = (SparkRDDWriteClient<T>) compactionClient;
-    HoodieWriteMetadata<JavaRDD<WriteStatus>> compactionMetadata = writeClient.compact(instant.getTimestamp());
+    HoodieWriteMetadata<JavaRDD<WriteStatus>> compactionMetadata = writeClient.compact(instantTime);
     List<HoodieWriteStat> writeStats = compactionMetadata.getCommitMetadata().get().getWriteStats();
     long numWriteErrors = writeStats.stream().mapToLong(HoodieWriteStat::getTotalWriteErrors).sum();
     if (numWriteErrors != 0) {
       // We treat even a single error in compaction as fatal
-      LOG.error("Compaction for instant (" + instant + ") failed with write errors. Errors :" + numWriteErrors);
+      LOG.error("Compaction for instant (" + instantTime + ") failed with write errors. Errors :" + numWriteErrors);
       throw new HoodieException(
-          "Compaction for instant (" + instant + ") failed with write errors. Errors :" + numWriteErrors);
+          "Compaction for instant (" + instantTime + ") failed with write errors. Errors :" + numWriteErrors);
     }
     // Commit compaction
-    writeClient.commitCompaction(instant.getTimestamp(), compactionMetadata.getCommitMetadata().get(), Option.empty());
+    writeClient.commitCompaction(instantTime, compactionMetadata.getCommitMetadata().get(), Option.empty());
   }
 }

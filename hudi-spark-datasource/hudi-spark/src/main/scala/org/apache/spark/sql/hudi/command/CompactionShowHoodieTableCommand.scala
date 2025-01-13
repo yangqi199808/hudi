@@ -17,12 +17,15 @@
 
 package org.apache.spark.sql.hudi.command
 
+import org.apache.hudi.SparkAdapterSupport
+
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference}
+import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.hudi.HoodieSqlCommonUtils.getTableLocation
-import org.apache.spark.sql.types.{IntegerType, StringType}
+import org.apache.spark.sql.hudi.command.procedures.ShowCompactionProcedure
 import org.apache.spark.sql.{Row, SparkSession}
 
+@Deprecated
 case class CompactionShowHoodieTableCommand(table: CatalogTable, limit: Int)
   extends HoodieLeafRunnableCommand {
 
@@ -31,11 +34,7 @@ case class CompactionShowHoodieTableCommand(table: CatalogTable, limit: Int)
     CompactionShowHoodiePathCommand(basePath, limit).run(sparkSession)
   }
 
-  override val output: Seq[Attribute] = {
-    Seq(
-      AttributeReference("timestamp", StringType, nullable = false)(),
-      AttributeReference("action", StringType, nullable = false)(),
-      AttributeReference("size", IntegerType, nullable = false)()
-    )
-  }
+  override val output: Seq[Attribute] =
+    SparkAdapterSupport.sparkAdapter.getSchemaUtils.toAttributes(
+      ShowCompactionProcedure.builder.get().build.outputType)
 }

@@ -18,19 +18,35 @@
 
 package org.apache.hudi.table.catalog;
 
-import org.apache.hudi.common.fs.FSUtils;
+import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.model.HoodieTableType;
+import org.apache.hudi.common.table.ParquetTableSchemaResolver;
+import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.exception.HoodieIOException;
+import org.apache.hudi.exception.HoodieValidationException;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.sync.common.util.SparkDataSourceTableUtils;
+import org.apache.hudi.util.AvroSchemaConverter;
 
+import org.apache.avro.Schema;
+import org.apache.flink.table.catalog.CatalogTable;
+import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.table.types.logical.VarCharType;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FSDataInputStream;
-import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.parquet.schema.MessageType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
@@ -39,6 +55,8 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.stream.Collectors;
 
+import static org.apache.flink.table.factories.FactoryUtil.CONNECTOR;
+import static org.apache.hudi.common.model.HoodieRecord.OPERATION_METADATA_FIELD;
 import static org.apache.hudi.common.table.HoodieTableMetaClient.AUXILIARYFOLDER_NAME;
 
 /**
@@ -46,6 +64,12 @@ import static org.apache.hudi.common.table.HoodieTableMetaClient.AUXILIARYFOLDER
  */
 public class TableOptionProperties {
   private static final Logger LOG = LoggerFactory.getLogger(TableOptionProperties.class);
+
+  public static final String SPARK_SOURCE_PROVIDER = "spark.sql.sources.provider";
+  public static final String SPARK_VERSION = "spark.version";
+  public static final String DEFAULT_SPARK_VERSION = "spark3.5.1";
+  static final Map<String, String> VALUE_MAPPING = new HashMap<>();
+  static final Map<String, String> KEY_MAPPING = new HashMap<>();
 
   private static final String FILE_NAME = "table_option.properties";
 
@@ -56,21 +80,58 @@ public class TableOptionProperties {
 
   public static final List<String> NON_OPTION_KEYS = Arrays.asList(PK_CONSTRAINT_NAME, PK_COLUMNS, COMMENT, PARTITION_COLUMNS);
 
+  static {
+    VALUE_MAPPING.put("mor", HoodieTableType.MERGE_ON_READ.name());
+    VALUE_MAPPING.put("cow", HoodieTableType.COPY_ON_WRITE.name());
+
+    VALUE_MAPPING.put(HoodieTableType.MERGE_ON_READ.name(), "mor");
+    VALUE_MAPPING.put(HoodieTableType.COPY_ON_WRITE.name(), "cow");
+
+    KEY_MAPPING.put("type", FlinkOptions.TABLE_TYPE.key());
+    KEY_MAPPING.put("primaryKey", FlinkOptions.RECORD_KEY_FIELD.key());
+    KEY_MAPPING.put("preCombineField", FlinkOptions.PRECOMBINE_FIELD.key());
+    KEY_MAPPING.put("payloadClass", FlinkOptions.PAYLOAD_CLASS_NAME.key());
+    KEY_MAPPING.put(SPARK_SOURCE_PROVIDER, CONNECTOR.key());
+    KEY_MAPPING.put(FlinkOptions.KEYGEN_CLASS_NAME.key(), FlinkOptions.KEYGEN_CLASS_NAME.key());
+    KEY_MAPPING.put(FlinkOptions.TABLE_TYPE.key(), "type");
+    KEY_MAPPING.put(FlinkOptions.RECORD_KEY_FIELD.key(), "primaryKey");
+    KEY_MAPPING.put(FlinkOptions.PRECOMBINE_FIELD.key(), "preCombineField");
+    KEY_MAPPING.put(FlinkOptions.PAYLOAD_CLASS_NAME.key(), "payloadClass");
+  }
+
   /**
    * Initialize the {@link #FILE_NAME} meta file.
    */
   public static void createProperties(String basePath,
                                       Configuration hadoopConf,
                                       Map<String, String> options) throws IOException {
+    Path propertiesFilePath = writePropertiesFile(basePath, hadoopConf, options, false);
+    LOG.info(String.format("Create file %s success.", propertiesFilePath));
+  }
+
+  /**
+   * Overwrite the {@link #FILE_NAME} meta file.
+   */
+  public static void overwriteProperties(String basePath,
+      Configuration hadoopConf,
+      Map<String, String> options) throws IOException {
+    Path propertiesFilePath = writePropertiesFile(basePath, hadoopConf, options, true);
+    LOG.info(String.format("Update file %s success.", propertiesFilePath));
+  }
+
+  private static Path writePropertiesFile(String basePath,
+      Configuration hadoopConf,
+      Map<String, String> options,
+      boolean isOverwrite) throws IOException {
     Path propertiesFilePath = getPropertiesFilePath(basePath);
-    FileSystem fs = FSUtils.getFs(basePath, hadoopConf);
-    try (FSDataOutputStream outputStream = fs.create(propertiesFilePath)) {
+    FileSystem fs = HadoopFSUtils.getFs(basePath, hadoopConf);
+    try (OutputStream outputStream = fs.create(propertiesFilePath, isOverwrite)) {
       Properties properties = new Properties();
       properties.putAll(options);
       properties.store(outputStream,
           "Table option properties saved on " + new Date(System.currentTimeMillis()));
     }
-    LOG.info(String.format("Create file %s success.", propertiesFilePath));
+    return propertiesFilePath;
   }
 
   /**
@@ -81,8 +142,8 @@ public class TableOptionProperties {
     Map<String, String> options = new HashMap<>();
     Properties props = new Properties();
 
-    FileSystem fs = FSUtils.getFs(basePath, hadoopConf);
-    try (FSDataInputStream inputStream = fs.open(propertiesFilePath)) {
+    FileSystem fs = HadoopFSUtils.getFs(basePath, hadoopConf);
+    try (InputStream inputStream = fs.open(propertiesFilePath)) {
       props.load(inputStream);
       for (final String name : props.stringPropertyNames()) {
         options.put(name, props.getProperty(name));
@@ -95,7 +156,7 @@ public class TableOptionProperties {
   }
 
   private static Path getPropertiesFilePath(String basePath) {
-    String auxPath = basePath + Path.SEPARATOR + AUXILIARYFOLDER_NAME;
+    String auxPath = basePath + StoragePath.SEPARATOR + AUXILIARYFOLDER_NAME;
     return new Path(auxPath, FILE_NAME);
   }
 
@@ -127,5 +188,62 @@ public class TableOptionProperties {
     Map<String, String> copied = new HashMap<>(options);
     NON_OPTION_KEYS.forEach(copied::remove);
     return copied;
+  }
+
+  public static Map<String, String> translateFlinkTableProperties2Spark(
+      CatalogTable catalogTable,
+      Configuration hadoopConf,
+      Map<String, String> properties,
+      List<String> partitionKeys,
+      boolean withOperationField) {
+    RowType rowType = supplementMetaFields((RowType) catalogTable.getSchema().toPhysicalRowDataType().getLogicalType(), withOperationField);
+    Schema schema = AvroSchemaConverter.convertToSchema(rowType);
+    MessageType messageType = ParquetTableSchemaResolver.convertAvroSchemaToParquet(schema, hadoopConf);
+    String sparkVersion = catalogTable.getOptions().getOrDefault(SPARK_VERSION, DEFAULT_SPARK_VERSION);
+    Map<String, String> sparkTableProperties = SparkDataSourceTableUtils.getSparkTableProperties(
+        partitionKeys,
+        sparkVersion,
+        4000,
+        messageType);
+    properties.putAll(sparkTableProperties);
+    return properties.entrySet().stream()
+        .filter(e -> KEY_MAPPING.containsKey(e.getKey()) && !catalogTable.getOptions().containsKey(KEY_MAPPING.get(e.getKey())))
+        .collect(Collectors.toMap(e -> KEY_MAPPING.get(e.getKey()),
+            e -> {
+              if (e.getKey().equalsIgnoreCase(FlinkOptions.TABLE_TYPE.key())) {
+                  String sparkTableType = VALUE_MAPPING.get(e.getValue());
+                  if (sparkTableType == null) {
+                    throw new HoodieValidationException(String.format("%s's value is invalid", e.getKey()));
+                  }
+                  return sparkTableType;
+              }
+              return e.getValue();
+            }));
+  }
+
+  private static RowType supplementMetaFields(RowType rowType, boolean withOperationField) {
+    Collection<String> metaFields = new ArrayList<>(HoodieRecord.HOODIE_META_COLUMNS);
+    if (withOperationField) {
+      metaFields.add(OPERATION_METADATA_FIELD);
+    }
+    ArrayList<RowType.RowField> rowFields = new ArrayList<>();
+    for (String metaField : metaFields) {
+      rowFields.add(new RowType.RowField(metaField, new VarCharType(10000)));
+    }
+    rowFields.addAll(rowType.getFields());
+    return new RowType(false, rowFields);
+  }
+
+  public static Map<String, String> translateSparkTableProperties2Flink(Map<String, String> options) {
+    if (options.containsKey(CONNECTOR.key())) {
+      return options;
+    }
+    return options.entrySet().stream().filter(e -> KEY_MAPPING.containsKey(e.getKey()))
+        .collect(Collectors.toMap(e -> KEY_MAPPING.get(e.getKey()),
+            e -> e.getKey().equalsIgnoreCase("type") ? VALUE_MAPPING.get(e.getValue()) : e.getValue()));
+  }
+
+  public static Map<String, String> translateSparkTableProperties2Flink(Table hiveTable) {
+    return translateSparkTableProperties2Flink(hiveTable.getParameters());
   }
 }

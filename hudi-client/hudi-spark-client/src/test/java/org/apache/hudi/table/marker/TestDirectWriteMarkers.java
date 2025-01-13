@@ -19,18 +19,18 @@
 package org.apache.hudi.table.marker;
 
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
-import org.apache.hudi.common.fs.FSUtils;
-import org.apache.hudi.common.testutils.FileSystemTestUtils;
+import org.apache.hudi.common.testutils.HoodieTestTable;
 import org.apache.hudi.common.util.CollectionUtils;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.StoragePathInfo;
 import org.apache.hudi.testutils.HoodieClientTestUtils;
 
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.Path;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 
 import java.io.IOException;
+import java.nio.file.Paths;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -46,10 +46,10 @@ public class TestDirectWriteMarkers extends TestWriteMarkersBase {
     this.jsc = new JavaSparkContext(
         HoodieClientTestUtils.getSparkConfForTest(TestDirectWriteMarkers.class.getName()));
     this.context = new HoodieSparkEngineContext(jsc);
-    this.fs = FSUtils.getFs(metaClient.getBasePath(), metaClient.getHadoopConf());
-    this.markerFolderPath =  new Path(metaClient.getMarkerFolderPath("000"));
+    this.storage = metaClient.getStorage();
+    this.markerFolderPath = new StoragePath(Paths.get(metaClient.getMarkerFolderPath("000")).toUri());
     this.writeMarkers = new DirectWriteMarkers(
-        fs, metaClient.getBasePath(), markerFolderPath.toString(), "000");
+        storage, metaClient.getBasePath().toString(), markerFolderPath.toString(), "000");
   }
 
   @AfterEach
@@ -60,16 +60,16 @@ public class TestDirectWriteMarkers extends TestWriteMarkersBase {
 
   @Override
   void verifyMarkersInFileSystem(boolean isTablePartitioned) throws IOException {
-    List<FileStatus> markerFiles = FileSystemTestUtils.listRecursive(fs, markerFolderPath)
+    List<StoragePathInfo> markerFiles = HoodieTestTable.listRecursive(storage, markerFolderPath)
         .stream().filter(status -> status.getPath().getName().contains(".marker"))
         .sorted().collect(Collectors.toList());
     assertEquals(3, markerFiles.size());
     assertIterableEquals(CollectionUtils.createImmutableList(
-            "file:" + markerFolderPath.toString()
+            markerFolderPath.toString()
                 + (isTablePartitioned ? "/2020/06/01" : "") + "/file1.marker.MERGE",
-            "file:" + markerFolderPath.toString()
+            markerFolderPath.toString()
                 + (isTablePartitioned ? "/2020/06/02" : "") + "/file2.marker.APPEND",
-            "file:" + markerFolderPath.toString()
+            markerFolderPath.toString()
                 + (isTablePartitioned ? "/2020/06/03" : "") + "/file3.marker.CREATE"),
         markerFiles.stream().map(m -> m.getPath().toString()).collect(Collectors.toList())
     );

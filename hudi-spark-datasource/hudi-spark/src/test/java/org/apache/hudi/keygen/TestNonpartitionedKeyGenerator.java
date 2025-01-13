@@ -18,13 +18,14 @@
 
 package org.apache.hudi.keygen;
 
-import org.apache.avro.generic.GenericRecord;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
 import org.apache.hudi.exception.HoodieKeyException;
 import org.apache.hudi.keygen.constant.KeyGeneratorOptions;
 import org.apache.hudi.testutils.KeyGeneratorTestUtilities;
+
+import org.apache.avro.generic.GenericRecord;
 import org.apache.spark.sql.Row;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -68,7 +69,11 @@ public class TestNonpartitionedKeyGenerator extends KeyGeneratorTestUtilities {
 
   @Test
   public void testNullRecordKeyFields() {
-    Assertions.assertThrows(IllegalArgumentException.class, () -> new NonpartitionedKeyGenerator(getPropertiesWithoutRecordKeyProp()));
+    GenericRecord record = getRecord();
+    Assertions.assertThrows(HoodieKeyException.class, () ->  {
+      BaseKeyGenerator keyGenerator = new NonpartitionedKeyGenerator(getPropertiesWithoutRecordKeyProp());
+      keyGenerator.getRecordKey(record);
+    });
   }
 
   @Test
@@ -94,7 +99,6 @@ public class TestNonpartitionedKeyGenerator extends KeyGeneratorTestUtilities {
   public void testWrongRecordKeyField() {
     NonpartitionedKeyGenerator keyGenerator = new NonpartitionedKeyGenerator(getWrongRecordKeyFieldProps());
     Assertions.assertThrows(HoodieKeyException.class, () -> keyGenerator.getRecordKey(getRecord()));
-    Assertions.assertThrows(HoodieKeyException.class, () -> keyGenerator.buildFieldPositionMapIfNeeded(KeyGeneratorTestUtilities.structType));
   }
 
   @Test
@@ -103,7 +107,7 @@ public class TestNonpartitionedKeyGenerator extends KeyGeneratorTestUtilities {
     properties.setProperty(KeyGeneratorOptions.RECORDKEY_FIELD_NAME.key(), "timestamp");
     properties.setProperty(KeyGeneratorOptions.PARTITIONPATH_FIELD_NAME.key(), "");
     NonpartitionedKeyGenerator keyGenerator = new NonpartitionedKeyGenerator(properties);
-    assertEquals(keyGenerator.getRecordKeyFields().size(), 1);
+    assertEquals(keyGenerator.getRecordKeyFieldNames().size(), 1);
     assertEquals(keyGenerator.getPartitionPathFields().size(), 0);
 
     HoodieTestDataGenerator dataGenerator = new HoodieTestDataGenerator();
@@ -120,7 +124,7 @@ public class TestNonpartitionedKeyGenerator extends KeyGeneratorTestUtilities {
     properties.setProperty(KeyGeneratorOptions.RECORDKEY_FIELD_NAME.key(), "timestamp,driver");
     properties.setProperty(KeyGeneratorOptions.PARTITIONPATH_FIELD_NAME.key(), "");
     NonpartitionedKeyGenerator keyGenerator = new NonpartitionedKeyGenerator(properties);
-    assertEquals(keyGenerator.getRecordKeyFields().size(), 2);
+    assertEquals(keyGenerator.getRecordKeyFieldNames().size(), 2);
     assertEquals(keyGenerator.getPartitionPathFields().size(), 0);
     HoodieTestDataGenerator dataGenerator = new HoodieTestDataGenerator();
     GenericRecord record = dataGenerator.generateGenericRecords(1).get(0);

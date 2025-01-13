@@ -19,9 +19,10 @@
 package org.apache.hudi.client.common;
 
 import org.apache.hudi.client.SparkTaskContextSupplier;
-import org.apache.hudi.common.config.SerializableConfiguration;
 import org.apache.hudi.common.data.HoodieAccumulator;
 import org.apache.hudi.common.data.HoodieData;
+import org.apache.hudi.common.data.HoodieData.HoodieDataCacheKey;
+import org.apache.hudi.common.data.HoodiePairData;
 import org.apache.hudi.common.engine.EngineProperty;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.function.SerializableBiFunction;
@@ -29,18 +30,30 @@ import org.apache.hudi.common.function.SerializableConsumer;
 import org.apache.hudi.common.function.SerializableFunction;
 import org.apache.hudi.common.function.SerializablePairFlatMapFunction;
 import org.apache.hudi.common.function.SerializablePairFunction;
+import org.apache.hudi.common.util.Functions;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.ImmutablePair;
 import org.apache.hudi.common.util.collection.Pair;
+import org.apache.hudi.data.HoodieJavaPairRDD;
 import org.apache.hudi.data.HoodieJavaRDD;
 import org.apache.hudi.data.HoodieSparkLongAccumulator;
 import org.apache.hudi.exception.HoodieException;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.spark.SparkConf;
+import org.apache.spark.api.java.JavaPairRDD;
+import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.sql.SQLContext;
-import scala.Tuple2;
 
+import javax.annotation.concurrent.ThreadSafe;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -48,25 +61,33 @@ import java.util.Objects;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import scala.Tuple2;
+
 /**
  * A Spark engine implementation of HoodieEngineContext.
  */
+@ThreadSafe
 public class HoodieSparkEngineContext extends HoodieEngineContext {
 
   private final JavaSparkContext javaSparkContext;
-  private SQLContext sqlContext;
+  private final SQLContext sqlContext;
+  private final Map<HoodieDataCacheKey, List<Integer>> cachedRddIds = new HashMap<>();
 
   public HoodieSparkEngineContext(JavaSparkContext jsc) {
-    super(new SerializableConfiguration(jsc.hadoopConfiguration()), new SparkTaskContextSupplier());
-    this.javaSparkContext = jsc;
-    this.sqlContext = SQLContext.getOrCreate(jsc.sc());
+    this(jsc, SQLContext.getOrCreate(jsc.sc()));
   }
 
-  public void setSqlContext(SQLContext sqlContext) {
+  public HoodieSparkEngineContext(JavaSparkContext jsc, SQLContext sqlContext) {
+    super(HadoopFSUtils.getStorageConfWithCopy(jsc.hadoopConfiguration()), new SparkTaskContextSupplier());
+    this.javaSparkContext = jsc;
     this.sqlContext = sqlContext;
   }
 
   public JavaSparkContext getJavaSparkContext() {
+    return javaSparkContext;
+  }
+
+  public JavaSparkContext jsc() {
     return javaSparkContext;
   }
 
@@ -88,6 +109,15 @@ public class HoodieSparkEngineContext extends HoodieEngineContext {
   @Override
   public <T> HoodieData<T> emptyHoodieData() {
     return HoodieJavaRDD.of(javaSparkContext.emptyRDD());
+  }
+
+  @Override
+  public <K, V> HoodiePairData<K, V> emptyHoodiePairData() {
+    return HoodieJavaPairRDD.of(JavaPairRDD.fromJavaRDD(javaSparkContext.emptyRDD()));
+  }
+
+  public boolean supportsFileGroupReader() {
+    return true;
   }
 
   @Override
@@ -156,7 +186,9 @@ public class HoodieSparkEngineContext extends HoodieEngineContext {
 
   @Override
   public void setProperty(EngineProperty key, String value) {
-    if (key == EngineProperty.COMPACTION_POOL_NAME) {
+    if (key.equals(EngineProperty.COMPACTION_POOL_NAME)
+        || key.equals(EngineProperty.CLUSTERING_POOL_NAME)
+        || key.equals(EngineProperty.DELTASYNC_POOL_NAME)) {
       javaSparkContext.setLocalProperty("spark.scheduler.pool", value);
     } else {
       throw new HoodieException("Unknown engine property :" + key);
@@ -173,6 +205,60 @@ public class HoodieSparkEngineContext extends HoodieEngineContext {
 
   @Override
   public void setJobStatus(String activeModule, String activityDescription) {
-    javaSparkContext.setJobGroup(activeModule, activityDescription);
+    javaSparkContext.setJobDescription(String.format("%s:%s", activeModule, activityDescription));
+  }
+
+  @Override
+  public void putCachedDataIds(HoodieDataCacheKey cacheKey, int... ids) {
+    synchronized (cachedRddIds) {
+      cachedRddIds.putIfAbsent(cacheKey, new ArrayList<>());
+      for (int id : ids) {
+        cachedRddIds.get(cacheKey).add(id);
+      }
+    }
+  }
+
+  @Override
+  public List<Integer> getCachedDataIds(HoodieDataCacheKey cacheKey) {
+    synchronized (cachedRddIds) {
+      return cachedRddIds.getOrDefault(cacheKey, Collections.emptyList());
+    }
+  }
+
+  @Override
+  public List<Integer> removeCachedDataIds(HoodieDataCacheKey cacheKey) {
+    synchronized (cachedRddIds) {
+      List<Integer> removed = cachedRddIds.remove(cacheKey);
+      return removed == null ? Collections.emptyList() : removed;
+    }
+  }
+
+  @Override
+  public void cancelJob(String groupId) {
+    javaSparkContext.cancelJobGroup(groupId);
+  }
+
+  @Override
+  public void cancelAllJobs() {
+    javaSparkContext.cancelAllJobs();
+  }
+
+  @Override
+  public <I, O> O aggregate(HoodieData<I> data, O zeroValue, Functions.Function2<O, I, O> seqOp, Functions.Function2<O, O, O> combOp) {
+    Function2<O, I, O> seqOpFunc = seqOp::apply;
+    Function2<O, O, O> combOpFunc = combOp::apply;
+    return HoodieJavaRDD.getJavaRDD(data).aggregate(zeroValue, seqOpFunc, combOpFunc);
+  }
+
+  public SparkConf getConf() {
+    return javaSparkContext.getConf();
+  }
+
+  public Configuration hadoopConfiguration() {
+    return javaSparkContext.hadoopConfiguration();
+  }
+
+  public <T> JavaRDD<T> emptyRDD() {
+    return javaSparkContext.emptyRDD();
   }
 }

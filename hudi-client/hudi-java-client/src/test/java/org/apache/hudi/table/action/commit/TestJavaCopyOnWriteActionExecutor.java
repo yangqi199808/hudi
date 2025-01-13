@@ -21,29 +21,31 @@ package org.apache.hudi.table.action.commit;
 import org.apache.hudi.client.HoodieJavaWriteClient;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.common.bloom.BloomFilter;
+import org.apache.hudi.common.config.HoodieStorageConfig;
 import org.apache.hudi.common.engine.EngineType;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieAvroRecord;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieTableType;
+import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
 import org.apache.hudi.common.testutils.HoodieTestUtils;
 import org.apache.hudi.common.testutils.RawTripTestPayload;
 import org.apache.hudi.common.testutils.Transformations;
-import org.apache.hudi.common.util.BaseFileUtils;
+import org.apache.hudi.common.util.FileFormatUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
-import org.apache.hudi.config.HoodieStorageConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.hadoop.HoodieParquetInputFormat;
 import org.apache.hudi.hadoop.utils.HoodieHiveUtils;
 import org.apache.hudi.io.HoodieCreateHandle;
+import org.apache.hudi.storage.StoragePath;
 import org.apache.hudi.table.HoodieJavaCopyOnWriteTable;
 import org.apache.hudi.table.HoodieJavaTable;
 import org.apache.hudi.table.HoodieTable;
-import org.apache.hudi.testutils.HoodieJavaClientTestBase;
+import org.apache.hudi.testutils.HoodieJavaClientTestHarness;
 import org.apache.hudi.testutils.MetadataMergeWriteStatus;
 
 import org.apache.avro.Schema;
@@ -52,11 +54,11 @@ import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.mapred.FileInputFormat;
 import org.apache.hadoop.mapred.JobConf;
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
 import org.apache.parquet.avro.AvroReadSupport;
 import org.apache.parquet.hadoop.ParquetReader;
 import org.junit.jupiter.api.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.nio.file.Paths;
@@ -76,9 +78,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestBase {
+public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestHarness {
 
-  private static final Logger LOG = LogManager.getLogger(TestJavaCopyOnWriteActionExecutor.class);
+  private static final Logger LOG = LoggerFactory.getLogger(TestJavaCopyOnWriteActionExecutor.class);
   private static final Schema SCHEMA = getSchemaFromResource(TestJavaCopyOnWriteActionExecutor.class, "/exampleSchema.avsc");
 
   @Test
@@ -91,7 +93,7 @@ public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestBase 
     metaClient = HoodieTableMetaClient.reload(metaClient);
     HoodieTable table = HoodieJavaTable.create(config, context, metaClient);
 
-    Pair<Path, String> newPathWithWriteToken = Arrays.asList(1).stream().map(x -> {
+    Pair<StoragePath, String> newPathWithWriteToken = Arrays.asList(1).stream().map(x -> {
       HoodieRecord record = mock(HoodieRecord.class);
       when(record.getPartitionPath()).thenReturn(partitionPath);
       String writeToken = FSUtils.makeWriteToken(context.getTaskContextSupplier().getPartitionIdSupplier().get(),
@@ -99,11 +101,13 @@ public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestBase 
           context.getTaskContextSupplier().getAttemptIdSupplier().get());
       HoodieCreateHandle io = new HoodieCreateHandle(config, instantTime, table, partitionPath, fileName,
           context.getTaskContextSupplier());
-      return Pair.of(io.makeNewPath(record.getPartitionPath()), writeToken);
+      Pair<StoragePath, String> result = Pair.of(io.makeNewPath(record.getPartitionPath()), writeToken);
+      io.close();
+      return result;
     }).collect(Collectors.toList()).get(0);
 
     assertEquals(newPathWithWriteToken.getKey().toString(), Paths.get(this.basePath, partitionPath,
-        FSUtils.makeDataFileName(instantTime, newPathWithWriteToken.getRight(), fileName)).toString());
+        FSUtils.makeBaseFileName(instantTime, newPathWithWriteToken.getRight(), fileName, HoodieTableConfig.BASE_FILE_FORMAT.defaultValue().getFileExtension())).toString());
   }
 
   private HoodieWriteConfig makeHoodieClientConfig() {
@@ -127,7 +131,7 @@ public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestBase 
     HoodieJavaWriteClient writeClient = getHoodieWriteClient(config);
     writeClient.startCommitWithTime(firstCommitTime);
     metaClient = HoodieTableMetaClient.reload(metaClient);
-    BaseFileUtils fileUtils = BaseFileUtils.getInstance(metaClient);
+    FileFormatUtils fileUtils = getFileUtilsInstance(metaClient);
 
     String partitionPath = "2016/01/31";
 
@@ -157,13 +161,13 @@ public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestBase 
 
     // Read out the bloom filter and make sure filter can answer record exist or not
     Path filePath = allFiles[0].getPath();
-    BloomFilter filter = fileUtils.readBloomFilterFromMetadata(hadoopConf, filePath);
+    BloomFilter filter = fileUtils.readBloomFilterFromMetadata(storage, new StoragePath(filePath.toUri()));
     for (HoodieRecord record : records) {
       assertTrue(filter.mightContain(record.getRecordKey()));
     }
 
     // Read the base file, check the record content
-    List<GenericRecord> fileRecords = fileUtils.readAvroRecords(hadoopConf, filePath);
+    List<GenericRecord> fileRecords = fileUtils.readAvroRecords(storage, new StoragePath(filePath.toUri()));
     GenericRecord newRecord;
     int index = 0;
     for (GenericRecord record : fileRecords) {
@@ -198,7 +202,7 @@ public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestBase 
     // Check whether the record has been updated
     Path updatedFilePath = allFiles[0].getPath();
     BloomFilter updatedFilter =
-        fileUtils.readBloomFilterFromMetadata(hadoopConf, updatedFilePath);
+        fileUtils.readBloomFilterFromMetadata(storage, new StoragePath(updatedFilePath.toUri()));
     for (HoodieRecord record : records) {
       // No change to the _row_key
       assertTrue(updatedFilter.mightContain(record.getRecordKey()));
@@ -227,9 +231,9 @@ public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestBase 
       throws Exception {
     // initialize parquet input format
     HoodieParquetInputFormat hoodieInputFormat = new HoodieParquetInputFormat();
-    JobConf jobConf = new JobConf(hadoopConf);
+    JobConf jobConf = new JobConf(storageConf.unwrap());
     hoodieInputFormat.setConf(jobConf);
-    HoodieTestUtils.init(hadoopConf, basePath, HoodieTableType.COPY_ON_WRITE);
+    HoodieTestUtils.init(storageConf, basePath, HoodieTableType.COPY_ON_WRITE);
     setupIncremental(jobConf, startCommitTime, numCommitsToPull);
     FileInputFormat.setInputPaths(jobConf, Paths.get(basePath, partitionPath).toString());
     return hoodieInputFormat.listStatus(jobConf);
@@ -318,7 +322,7 @@ public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestBase 
   }
 
   @Test
-    public void testInsertRecords() throws Exception {
+  public void testInsertRecords() throws Exception {
     HoodieWriteConfig config = makeHoodieClientConfig();
     String instantTime = makeNewCommitTime();
     metaClient = HoodieTableMetaClient.reload(metaClient);
@@ -379,7 +383,7 @@ public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestBase 
 
     List<HoodieRecord> records = new ArrayList<>();
     // Approx 1150 records are written for block size of 64KB
-    for (int i = 0; i < 2000; i++) {
+    for (int i = 0; i < 2050; i++) {
       String recordStr = "{\"_row_key\":\"" + UUID.randomUUID().toString()
           + "\",\"time\":\"2016-01-31T03:16:41.415Z\",\"number\":" + i + "}";
       RawTripTestPayload rowChange = new RawTripTestPayload(recordStr);
@@ -402,16 +406,16 @@ public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestBase 
         counts++;
       }
     }
+    // we check canWrite only once every 1000 records. and so 2 files with 1000 records and 3rd file with 50 records.
     assertEquals(3, counts, "If the number of records are more than 1150, then there should be a new file");
   }
 
   @Test
   public void testInsertUpsertWithHoodieAvroPayload() throws Exception {
-    Schema schema = getSchemaFromResource(TestJavaCopyOnWriteActionExecutor.class, "/testDataGeneratorSchema.txt");
     HoodieWriteConfig config = HoodieWriteConfig.newBuilder()
         .withEngineType(EngineType.JAVA)
         .withPath(basePath)
-        .withSchema(schema.toString())
+        .withSchema(TRIP_EXAMPLE_SCHEMA)
         .withStorageConfig(HoodieStorageConfig.newBuilder()
             .parquetMaxFileSize(1000 * 1024).hfileMaxFileSize(1000 * 1024).build())
         .build();
@@ -429,7 +433,9 @@ public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestBase 
 
     WriteStatus writeStatus = ws.get(0).get(0);
     String fileId = writeStatus.getFileId();
-    metaClient.getFs().create(new Path(Paths.get(basePath, ".hoodie", "000.commit").toString())).close();
+    metaClient.getStorage()
+        .create(new StoragePath(Paths.get(basePath, ".hoodie/timeline", "000.commit").toString()))
+        .close();
     //TODO : Find race condition that causes the timeline sometime to reflect 000.commit and sometimes not
     final HoodieJavaCopyOnWriteTable reloadedTable = (HoodieJavaCopyOnWriteTable) HoodieJavaTable.create(config, context, HoodieTableMetaClient.reload(metaClient));
 
@@ -463,6 +469,90 @@ public class TestJavaCopyOnWriteActionExecutor extends HoodieJavaClientTestBase 
         context, config, table, instantTime, inputRecords, Option.empty());
     List<WriteStatus> returnedStatuses = (List<WriteStatus>)bulkInsertExecutor.execute().getWriteStatuses();
     verifyStatusResult(returnedStatuses, generateExpectedPartitionNumRecords(inputRecords));
+  }
+
+  @Test
+  public void testDeleteRecords() throws Exception {
+    // Prepare the AvroParquetIO
+    HoodieWriteConfig config = makeHoodieClientConfig();
+    int startInstant = 1;
+    String firstCommitTime = makeNewCommitTime(startInstant++, "%09d");
+    HoodieJavaWriteClient writeClient = getHoodieWriteClient(config);
+    writeClient.startCommitWithTime(firstCommitTime);
+    metaClient = HoodieTableMetaClient.reload(metaClient);
+    FileFormatUtils fileUtils = getFileUtilsInstance(metaClient);
+
+    String partitionPath = "2022/04/09";
+
+    // Get some records belong to the same partition (2016/01/31)
+    String recordStr1 = "{\"_row_key\":\"8eb5b87a-1feh-4edd-87b4-6ec96dc405a0\","
+            + "\"time\":\"2022-04-09T03:16:41.415Z\",\"number\":1}";
+    String recordStr2 = "{\"_row_key\":\"8eb5b87b-1feu-4edd-87b4-6ec96dc405a0\","
+            + "\"time\":\"2022-04-09T03:20:41.415Z\",\"number\":2}";
+    String recordStr3 = "{\"_row_key\":\"8eb5b87c-1fej-4edd-87b4-6ec96dc405a0\","
+            + "\"time\":\"2022-04-09T03:16:41.415Z\",\"number\":3}";
+
+    List<HoodieRecord> records = new ArrayList<>();
+    RawTripTestPayload rowChange1 = new RawTripTestPayload(recordStr1);
+    records.add(new HoodieAvroRecord(new HoodieKey(rowChange1.getRowKey(), rowChange1.getPartitionPath()), rowChange1));
+    RawTripTestPayload rowChange2 = new RawTripTestPayload(recordStr2);
+    records.add(new HoodieAvroRecord(new HoodieKey(rowChange2.getRowKey(), rowChange2.getPartitionPath()), rowChange2));
+    RawTripTestPayload rowChange3 = new RawTripTestPayload(recordStr3);
+    records.add(new HoodieAvroRecord(new HoodieKey(rowChange3.getRowKey(), rowChange3.getPartitionPath()), rowChange3));
+
+    // Insert new records
+    writeClient.insert(records, firstCommitTime);
+
+    FileStatus[] allFiles = getIncrementalFiles(partitionPath, "0", -1);
+    assertEquals(1, allFiles.length);
+
+    // Read out the bloom filter and make sure filter can answer record exist or not
+    Path filePath = allFiles[0].getPath();
+    BloomFilter filter = fileUtils.readBloomFilterFromMetadata(storage, new StoragePath(filePath.toUri()));
+    for (HoodieRecord record : records) {
+      assertTrue(filter.mightContain(record.getRecordKey()));
+    }
+
+    // Read the base file, check the record content
+    List<GenericRecord> fileRecords = fileUtils.readAvroRecords(storage, new StoragePath(filePath.toUri()));
+    int index = 0;
+    for (GenericRecord record : fileRecords) {
+      assertEquals(records.get(index).getRecordKey(), record.get("_row_key").toString());
+      index++;
+    }
+
+    String newCommitTime = makeNewCommitTime(startInstant++, "%09d");
+    writeClient.startCommitWithTime(newCommitTime);
+
+    // Test delete two records
+    List<HoodieKey> keysForDelete = new ArrayList(Arrays.asList(records.get(0).getKey(), records.get(2).getKey()));
+    writeClient.delete(keysForDelete, newCommitTime);
+
+    allFiles = getIncrementalFiles(partitionPath, "0", -1);
+    assertEquals(1, allFiles.length);
+
+    filePath = allFiles[0].getPath();
+    // Read the base file, check the record content
+    fileRecords = fileUtils.readAvroRecords(storage, new StoragePath(filePath.toUri()));
+    // Check that the two records are deleted successfully
+    assertEquals(1, fileRecords.size());
+    assertEquals(records.get(1).getRecordKey(), fileRecords.get(0).get("_row_key").toString());
+
+    newCommitTime = makeNewCommitTime(startInstant++, "%09d");
+    writeClient.startCommitWithTime(newCommitTime);
+
+    // Test delete last record
+    keysForDelete = new ArrayList(Arrays.asList(records.get(1).getKey()));
+    writeClient.delete(keysForDelete, newCommitTime);
+
+    allFiles = getIncrementalFiles(partitionPath, "0", -1);
+    assertEquals(1, allFiles.length);
+
+    filePath = allFiles[0].getPath();
+    // Read the base file, check the record content
+    fileRecords = fileUtils.readAvroRecords(storage, new StoragePath(filePath.toUri()));
+    // Check whether all records have been deleted
+    assertEquals(0, fileRecords.size());
   }
 
   public static Map<String, Long> generateExpectedPartitionNumRecords(List<HoodieRecord> records) {

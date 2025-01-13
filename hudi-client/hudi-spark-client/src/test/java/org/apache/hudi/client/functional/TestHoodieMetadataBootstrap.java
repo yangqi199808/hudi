@@ -23,19 +23,19 @@ import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.table.view.FileSystemViewStorageConfig;
 import org.apache.hudi.common.testutils.FileCreateUtils;
-import org.apache.hudi.common.testutils.HoodieMetadataTestTable;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
 import org.apache.hudi.common.testutils.HoodieTestTable;
-import org.apache.hudi.config.HoodieCompactionConfig;
+import org.apache.hudi.config.HoodieArchivalConfig;
+import org.apache.hudi.config.HoodieCleanConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -52,7 +52,7 @@ import static org.apache.hudi.common.model.WriteOperationType.UPSERT;
 @Tag("functional")
 public class TestHoodieMetadataBootstrap extends TestHoodieMetadataBase {
 
-  private static final Logger LOG = LogManager.getLogger(TestHoodieMetadataBootstrap.class);
+  private static final Logger LOG = LoggerFactory.getLogger(TestHoodieMetadataBootstrap.class);
 
   @ParameterizedTest
   @EnumSource(HoodieTableType.class)
@@ -105,7 +105,7 @@ public class TestHoodieMetadataBootstrap extends TestHoodieMetadataBase {
 
     // validate
     validateMetadata(testTable);
-    // after bootstrap do two writes and validate its still functional.
+    // after bootstrap do two writes and validate it's still functional.
     doWriteInsertAndUpsert(testTable);
     validateMetadata(testTable);
   }
@@ -166,20 +166,19 @@ public class TestHoodieMetadataBootstrap extends TestHoodieMetadataBase {
     HoodieTableType tableType = COPY_ON_WRITE;
     init(tableType, false);
 
+    // In real production env, bootstrap action can only happen on empty table,
+    // otherwise we need to roll back the previous bootstrap first,
+    // see 'SparkBootstrapCommitActionExecutor.execute' for more details.
     doPreBootstrapWriteOperation(testTable, INSERT, "0000001");
     doPreBootstrapWriteOperation(testTable, "0000002");
     // add an inflight commit
     HoodieCommitMetadata inflightCommitMeta = testTable.doWriteOperation("00000007", UPSERT, emptyList(),
-        asList("p1", "p2"), 2, true, true);
+        asList("p1", "p2"), 2, false, true);
     // bootstrap and following validation should fail. bootstrap should not happen.
     bootstrapAndVerifyFailure();
 
     // once the commit is complete, metadata should get fully synced.
-    // in prod code path, SparkHoodieBackedTableMetadataWriter.create() will be called for every commit,
-    // which may not be the case here if we directly call HoodieBackedTableMetadataWriter.update()
-    // hence lets first move the commit to complete and invoke sync directly
-    ((HoodieMetadataTestTable) testTable).moveInflightCommitToComplete("00000007", inflightCommitMeta, true);
-    syncTableMetadata(writeConfig);
+    testTable.moveInflightCommitToComplete("00000007", inflightCommitMeta);
     validateMetadata(testTable);
   }
 
@@ -251,7 +250,7 @@ public class TestHoodieMetadataBootstrap extends TestHoodieMetadataBase {
     initWriteConfigAndMetatableWriter(writeConfig, true);
     syncTableMetadata(writeConfig);
     validateMetadata(testTable);
-    // after bootstrap do two writes and validate its still functional.
+    // after bootstrap do two writes and validate it's still functional.
     doWriteInsertAndUpsert(testTable);
     validateMetadata(testTable);
   }
@@ -260,12 +259,8 @@ public class TestHoodieMetadataBootstrap extends TestHoodieMetadataBase {
     writeConfig = getWriteConfig(true, true);
     initWriteConfigAndMetatableWriter(writeConfig, true);
     syncTableMetadata(writeConfig);
-    try {
-      validateMetadata(testTable);
-      Assertions.fail("Should have failed");
-    } catch (IllegalStateException e) {
-      // expected
-    }
+    Assertions.assertThrows(Error.class, () -> validateMetadata(testTable),
+        "expected 6 lines, but only got 4");
   }
 
   private void doWriteInsertAndUpsert(HoodieTestTable testTable) throws Exception {
@@ -275,7 +270,10 @@ public class TestHoodieMetadataBootstrap extends TestHoodieMetadataBase {
   private HoodieWriteConfig getWriteConfig(int minArchivalCommits, int maxArchivalCommits) throws Exception {
     return HoodieWriteConfig.newBuilder().withPath(basePath)
         .withSchema(HoodieTestDataGenerator.TRIP_EXAMPLE_SCHEMA).withParallelism(2, 2)
-        .withCompactionConfig(HoodieCompactionConfig.newBuilder().retainCommits(1).archiveCommitsWith(minArchivalCommits, maxArchivalCommits).build())
+        .withCleanConfig(HoodieCleanConfig.newBuilder()
+            .retainCommits(1).build())
+        .withArchivalConfig(HoodieArchivalConfig.newBuilder()
+            .archiveCommitsWith(minArchivalCommits, maxArchivalCommits).build())
         .withFileSystemViewConfig(FileSystemViewStorageConfig.newBuilder()
             .withRemoteServerPort(timelineServicePort).build())
         .withMetadataConfig(HoodieMetadataConfig.newBuilder().enable(true).build())

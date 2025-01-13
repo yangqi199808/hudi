@@ -23,6 +23,7 @@ import org.apache.hudi.common.model.HoodieTableType;
 
 import org.apache.hudi.integ.HoodieTestHiveBase;
 
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -30,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Integration test class for HoodieSyncCommand in hudi-cli module.
  */
+@Disabled("HUDI-8274")
 public class ITTestHoodieSyncCommand extends HoodieTestHiveBase {
 
   private static final String HUDI_CLI_TOOL = HOODIE_WS_ROOT + "/hudi-cli/hudi-cli.sh";
@@ -49,18 +51,18 @@ public class ITTestHoodieSyncCommand extends HoodieTestHiveBase {
         hiveTableName, HoodieTableType.COPY_ON_WRITE.name(), PartitionType.SINGLE_KEY_PARTITIONED, "append", hiveTableName);
 
     TestExecStartResultCallback result =
-        executeCommandStringInDocker(ADHOC_1_CONTAINER, HUDI_CLI_TOOL + " --cmdfile " + SYNC_VALIDATE_COMMANDS, true);
+        executeCommandStringInDocker(ADHOC_1_CONTAINER, HUDI_CLI_TOOL + " script --file " + SYNC_VALIDATE_COMMANDS, true);
 
     String expected = String.format("Count difference now is (count(%s) - count(%s) == %d. Catch up count is %d",
         hiveTableName, hiveTableName2, 100, 200);
-    assertTrue(result.getStderr().toString().contains(expected));
+    assertTrue(result.getStdout().toString().contains(expected));
 
     dropHiveTables(hiveTableName, HoodieTableType.COPY_ON_WRITE.name());
     dropHiveTables(hiveTableName2, HoodieTableType.COPY_ON_WRITE.name());
   }
 
   private void syncHoodieTable(String hiveTableName, String op) throws Exception {
-    StringBuilder cmdBuilder = new StringBuilder("spark-submit --packages org.apache.spark:spark-avro_2.11:2.4.4 ")
+    StringBuilder cmdBuilder = new StringBuilder("spark-submit")
         .append(" --class org.apache.hudi.utilities.deltastreamer.HoodieDeltaStreamer ").append(HUDI_UTILITIES_BUNDLE)
         .append(" --table-type COPY_ON_WRITE ")
         .append(" --base-file-format ").append(HoodieFileFormat.PARQUET.toString())

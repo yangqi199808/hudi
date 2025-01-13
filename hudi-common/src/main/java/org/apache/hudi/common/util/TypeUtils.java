@@ -18,14 +18,19 @@
 package org.apache.hudi.common.util;
 
 import javax.annotation.Nonnull;
+
 import java.util.Arrays;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+/**
+ * Utils for Java type cast.
+ */
 public final class TypeUtils {
 
-  private TypeUtils() {}
+  private TypeUtils() {
+  }
 
   /**
    * Maps values from the provided Enum's {@link Class} into corresponding values,
@@ -37,6 +42,18 @@ public final class TypeUtils {
   ) {
     return Arrays.stream(klass.getEnumConstants())
         .collect(Collectors.toMap(valueMapper, Function.identity()));
+  }
+
+  /**
+   * This utility abstracts unsafe type-casting in a way that allows to
+   * <ul>
+   *   <li>Search for such type-casts more easily (just searching for usages of this method)</li>
+   *   <li>Avoid type-cast warnings from the compiler</li>
+   * </ul>
+   */
+  @SuppressWarnings("unchecked")
+  public static <T> T unsafeCast(Object o) {
+    return (T) o;
   }
 
 }

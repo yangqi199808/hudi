@@ -18,39 +18,41 @@
 
 package org.apache.hudi.io.storage.row;
 
-import org.apache.hadoop.conf.Configuration;
+import org.apache.hudi.avro.HoodieBloomFilterWriteSupport;
 import org.apache.hudi.common.bloom.BloomFilter;
-import org.apache.hudi.common.bloom.HoodieDynamicBoundedBloomFilter;
-import org.apache.hudi.config.HoodieWriteConfig;
+import org.apache.hudi.common.config.HoodieConfig;
+import org.apache.hudi.common.config.HoodieStorageConfig;
+import org.apache.hudi.common.util.Option;
+import org.apache.hudi.common.util.ReflectionUtils;
+
+import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.hadoop.api.WriteSupport;
 import org.apache.spark.sql.execution.datasources.parquet.ParquetWriteSupport;
 import org.apache.spark.sql.types.StructType;
+import org.apache.spark.unsafe.types.UTF8String;
 
-import java.util.HashMap;
+import java.util.Collections;
+import java.util.Map;
 
-import static org.apache.hudi.avro.HoodieAvroWriteSupport.HOODIE_AVRO_BLOOM_FILTER_METADATA_KEY;
-import static org.apache.hudi.avro.HoodieAvroWriteSupport.HOODIE_BLOOM_FILTER_TYPE_CODE;
-import static org.apache.hudi.avro.HoodieAvroWriteSupport.HOODIE_MAX_RECORD_KEY_FOOTER;
-import static org.apache.hudi.avro.HoodieAvroWriteSupport.HOODIE_MIN_RECORD_KEY_FOOTER;
+import static org.apache.hudi.common.config.HoodieStorageConfig.PARQUET_FIELD_ID_WRITE_ENABLED;
 
 /**
  * Hoodie Write Support for directly writing Row to Parquet.
  */
 public class HoodieRowParquetWriteSupport extends ParquetWriteSupport {
 
-  private Configuration hadoopConf;
-  private BloomFilter bloomFilter;
-  private String minRecordKey;
-  private String maxRecordKey;
+  private final Configuration hadoopConf;
+  private final Option<HoodieBloomFilterWriteSupport<UTF8String>> bloomFilterWriteSupportOpt;
 
-  public HoodieRowParquetWriteSupport(Configuration conf, StructType structType, BloomFilter bloomFilter, HoodieWriteConfig writeConfig) {
-    super();
+  public HoodieRowParquetWriteSupport(Configuration conf, StructType structType, Option<BloomFilter> bloomFilterOpt, HoodieConfig config) {
     Configuration hadoopConf = new Configuration(conf);
-    hadoopConf.set("spark.sql.parquet.writeLegacyFormat", writeConfig.parquetWriteLegacyFormatEnabled());
-    hadoopConf.set("spark.sql.parquet.outputTimestampType", writeConfig.parquetOutputTimestampType());
-    this.hadoopConf = hadoopConf;
+    hadoopConf.set("spark.sql.parquet.writeLegacyFormat", config.getStringOrDefault(HoodieStorageConfig.PARQUET_WRITE_LEGACY_FORMAT_ENABLED, "false"));
+    hadoopConf.set("spark.sql.parquet.outputTimestampType", config.getStringOrDefault(HoodieStorageConfig.PARQUET_OUTPUT_TIMESTAMP_TYPE));
+    hadoopConf.set("spark.sql.parquet.fieldId.write.enabled", config.getStringOrDefault(PARQUET_FIELD_ID_WRITE_ENABLED));
     setSchema(structType, hadoopConf);
-    this.bloomFilter = bloomFilter;
+
+    this.hadoopConf = hadoopConf;
+    this.bloomFilterWriteSupportOpt = bloomFilterOpt.map(HoodieBloomFilterRowWriteSupport::new);
   }
 
   public Configuration getHadoopConf() {
@@ -59,32 +61,43 @@ public class HoodieRowParquetWriteSupport extends ParquetWriteSupport {
 
   @Override
   public WriteSupport.FinalizedWriteContext finalizeWrite() {
-    HashMap<String, String> extraMetaData = new HashMap<>();
-    if (bloomFilter != null) {
-      extraMetaData.put(HOODIE_AVRO_BLOOM_FILTER_METADATA_KEY, bloomFilter.serializeToString());
-      if (minRecordKey != null && maxRecordKey != null) {
-        extraMetaData.put(HOODIE_MIN_RECORD_KEY_FOOTER, minRecordKey);
-        extraMetaData.put(HOODIE_MAX_RECORD_KEY_FOOTER, maxRecordKey);
-      }
-      if (bloomFilter.getBloomFilterTypeCode().name().contains(HoodieDynamicBoundedBloomFilter.TYPE_CODE_PREFIX)) {
-        extraMetaData.put(HOODIE_BLOOM_FILTER_TYPE_CODE, bloomFilter.getBloomFilterTypeCode().name());
-      }
-    }
-    return new WriteSupport.FinalizedWriteContext(extraMetaData);
+    Map<String, String> extraMetadata =
+        bloomFilterWriteSupportOpt.map(HoodieBloomFilterWriteSupport::finalizeMetadata)
+            .orElse(Collections.emptyMap());
+
+    return new WriteSupport.FinalizedWriteContext(extraMetadata);
   }
 
-  public void add(String recordKey) {
-    this.bloomFilter.add(recordKey);
-    if (minRecordKey != null) {
-      minRecordKey = minRecordKey.compareTo(recordKey) <= 0 ? minRecordKey : recordKey;
-    } else {
-      minRecordKey = recordKey;
+  public void add(UTF8String recordKey) {
+    this.bloomFilterWriteSupportOpt.ifPresent(bloomFilterWriteSupport ->
+        bloomFilterWriteSupport.addKey(recordKey));
+  }
+
+  private static class HoodieBloomFilterRowWriteSupport extends HoodieBloomFilterWriteSupport<UTF8String> {
+    public HoodieBloomFilterRowWriteSupport(BloomFilter bloomFilter) {
+      super(bloomFilter);
     }
 
-    if (maxRecordKey != null) {
-      maxRecordKey = maxRecordKey.compareTo(recordKey) >= 0 ? maxRecordKey : recordKey;
-    } else {
-      maxRecordKey = recordKey;
+    @Override
+    protected byte[] getUTF8Bytes(UTF8String key) {
+      return key.getBytes();
+    }
+
+    @Override
+    protected UTF8String dereference(UTF8String key) {
+      // NOTE: [[clone]] is performed here (rather than [[copy]]) to only copy underlying buffer in
+      //       cases when [[UTF8String]] is pointing into a buffer storing the whole containing record,
+      //       and simply do a pass over when it holds a (immutable) buffer holding just the string
+      return key.clone();
     }
   }
+
+  public static HoodieRowParquetWriteSupport getHoodieRowParquetWriteSupport(Configuration conf, StructType structType,
+                                                                             Option<BloomFilter> bloomFilterOpt, HoodieConfig config) {
+    return (HoodieRowParquetWriteSupport) ReflectionUtils.loadClass(
+        config.getStringOrDefault(HoodieStorageConfig.HOODIE_PARQUET_SPARK_ROW_WRITE_SUPPORT_CLASS),
+        new Class<?>[] {Configuration.class, StructType.class, Option.class, HoodieConfig.class},
+        conf, structType, bloomFilterOpt, config);
+  }
+
 }

@@ -19,7 +19,7 @@
 package org.apache.hudi.table.action.commit;
 
 import org.apache.hudi.client.WriteStatus;
-import org.apache.hudi.common.data.HoodieList;
+import org.apache.hudi.common.data.HoodieListData;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.model.EmptyHoodieRecordPayload;
 import org.apache.hudi.common.model.HoodieAvroRecord;
@@ -42,11 +42,15 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.stream.Collectors;
 
+/**
+ * Flink delete helper.
+ */
 @SuppressWarnings("checkstyle:LineLength")
 public class FlinkDeleteHelper<R> extends
     BaseDeleteHelper<EmptyHoodieRecordPayload, List<HoodieRecord<EmptyHoodieRecordPayload>>, List<HoodieKey>, List<WriteStatus>, R> {
 
   private FlinkDeleteHelper() {
+    super(ignored -> -1);
   }
 
   private static class DeleteHelperHolder {
@@ -97,8 +101,7 @@ public class FlinkDeleteHelper<R> extends
           dedupedKeys.stream().map(key -> new HoodieAvroRecord<>(key, new EmptyHoodieRecordPayload())).collect(Collectors.toList());
       Instant beginTag = Instant.now();
       // perform index look up to get existing location of records
-      List<HoodieRecord<EmptyHoodieRecordPayload>> taggedRecords = HoodieList.getList(
-          table.getIndex().tagLocation(HoodieList.of(dedupedRecords), context, table));
+      List<HoodieRecord<EmptyHoodieRecordPayload>> taggedRecords = table.getIndex().tagLocation(HoodieListData.eager(dedupedRecords), context, table).collectAsList();
       Duration tagLocationDuration = Duration.between(beginTag, Instant.now());
 
       // filter out non existent keys/records
@@ -121,5 +124,4 @@ public class FlinkDeleteHelper<R> extends
       throw new HoodieUpsertException("Failed to delete for commit time " + instantTime, e);
     }
   }
-
 }

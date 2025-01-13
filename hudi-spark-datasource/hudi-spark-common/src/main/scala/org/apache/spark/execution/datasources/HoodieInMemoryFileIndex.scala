@@ -20,9 +20,13 @@ package org.apache.spark.execution.datasources
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path, PathFilter}
 import org.apache.hadoop.mapred.{FileInputFormat, JobConf}
+import org.apache.hudi.SparkAdapterSupport
+import org.apache.hudi.storage.StoragePath
 import org.apache.spark.HoodieHadoopFSUtils
 import org.apache.spark.metrics.source.HiveCatalogMetrics
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.{expressions, InternalRow}
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, BoundReference, Expression}
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.types.StructType
 
@@ -34,7 +38,78 @@ class HoodieInMemoryFileIndex(sparkSession: SparkSession,
                               parameters: Map[String, String],
                               userSpecifiedSchema: Option[StructType],
                               fileStatusCache: FileStatusCache = NoopCache)
-  extends InMemoryFileIndex(sparkSession, rootPathsSpecified, parameters, userSpecifiedSchema, fileStatusCache) {
+  extends InMemoryFileIndex(sparkSession, rootPathsSpecified, parameters, userSpecifiedSchema, fileStatusCache)
+  with SparkAdapterSupport {
+
+  /**
+   * Returns all valid files grouped into partitions when the data is partitioned. If the data is non-partitioned,
+   * this will return a single partition with no partition values
+   *
+   * NOTE: This method replicates the one it overrides, however it uses custom method
+   * that accepts files starting with "."
+   */
+  override def listFiles(partitionFilters: Seq[Expression], dataFilters: Seq[Expression]): Seq[PartitionDirectory] = {
+    val selectedPartitions = if (partitionSpec().partitionColumns.isEmpty) {
+      sparkAdapter.getSparkPartitionedFileUtils.newPartitionDirectory(
+        InternalRow.empty, allFiles().filter(f => isDataPath(f.getPath))) :: Nil
+    } else {
+      prunePartitions(partitionFilters, partitionSpec()).map {
+        case PartitionPath(values, path) =>
+          val files: Seq[FileStatus] = leafDirToChildrenFiles.get(path) match {
+            case Some(existingDir) =>
+              // Directory has children files in it, return them
+              existingDir.filter(f => isDataPath(f.getPath))
+
+            case None =>
+              // Directory does not exist, or has no children files
+              Nil
+          }
+          sparkAdapter.getSparkPartitionedFileUtils.newPartitionDirectory(values, files)
+      }
+    }
+    logTrace("Selected files after partition pruning:\n\t" + selectedPartitions.mkString("\n\t"))
+    selectedPartitions
+  }
+
+  private def isDataPath(path: Path): Boolean = {
+    val name = path.getName
+    !(name.startsWith("_") && !name.contains("="))
+  }
+
+  private def prunePartitions(
+      predicates: Seq[Expression],
+      partitionSpec: PartitionSpec): Seq[PartitionPath] = {
+    val PartitionSpec(partitionColumns, partitions) = partitionSpec
+    val partitionColumnNames = partitionColumns.map(_.name).toSet
+    val partitionPruningPredicates = predicates.filter {
+      _.references.map(_.name).toSet.subsetOf(partitionColumnNames)
+    }
+
+    if (partitionPruningPredicates.nonEmpty) {
+      val predicate = partitionPruningPredicates.reduce(expressions.And)
+
+      val boundPredicate = sparkAdapter.createInterpretedPredicate(predicate.transform {
+        case a: AttributeReference =>
+          val index = partitionColumns.indexWhere(a.name == _.name)
+          BoundReference(index, partitionColumns(index).dataType, nullable = true)
+      })
+
+      val selected = partitions.filter {
+        case PartitionPath(values, _) => boundPredicate.eval(values)
+      }
+      logInfo {
+        val total = partitions.length
+        val selectedSize = selected.length
+        val percentPruned = (1 - selectedSize.toDouble / total.toDouble) * 100
+        s"Selected $selectedSize partitions out of $total, " +
+          s"pruned ${if (total == 0) "0" else s"$percentPruned%"} partitions."
+      }
+
+      selected
+    } else {
+      partitions
+    }
+  }
 
   /**
    * List leaf files of given paths. This method will submit a Spark job to do parallel
@@ -77,7 +152,7 @@ class HoodieInMemoryFileIndex(sparkSession: SparkSession,
   protected def bulkListLeafFiles(sparkSession: SparkSession, paths: ArrayBuffer[Path], filter: PathFilter, hadoopConf: Configuration): Seq[(Path, Seq[FileStatus])] = {
     HoodieHadoopFSUtils.parallelListLeafFiles(
       sc = sparkSession.sparkContext,
-      paths = paths,
+      paths = paths.toSeq,
       hadoopConf = hadoopConf,
       filter = new PathFilterWrapper(filter),
       ignoreMissingFiles = sparkSession.sessionState.conf.ignoreMissingFiles,
@@ -89,9 +164,9 @@ class HoodieInMemoryFileIndex(sparkSession: SparkSession,
 }
 
 object HoodieInMemoryFileIndex {
-  def create(sparkSession: SparkSession, globbedPaths: Seq[Path]): HoodieInMemoryFileIndex = {
+  def create(sparkSession: SparkSession, globbedPaths: Seq[StoragePath]): HoodieInMemoryFileIndex = {
     val fileStatusCache = FileStatusCache.getOrCreate(sparkSession)
-    new HoodieInMemoryFileIndex(sparkSession, globbedPaths, Map(), Option.empty, fileStatusCache)
+    new HoodieInMemoryFileIndex(sparkSession, globbedPaths.map(e => new Path(e.toUri)), Map(), Option.empty, fileStatusCache)
   }
 }
 

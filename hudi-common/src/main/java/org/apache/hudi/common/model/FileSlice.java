@@ -18,9 +18,11 @@
 
 package org.apache.hudi.common.model;
 
+import org.apache.hudi.common.table.timeline.InstantComparison;
 import org.apache.hudi.common.util.Option;
 
 import java.io.Serializable;
+import java.util.List;
 import java.util.Objects;
 import java.util.TreeSet;
 import java.util.stream.Stream;
@@ -53,11 +55,17 @@ public class FileSlice implements Serializable {
   private final TreeSet<HoodieLogFile> logFiles;
 
   public FileSlice(FileSlice fileSlice) {
+    this(fileSlice, true);
+  }
+
+  private FileSlice(FileSlice fileSlice, boolean includeLogFiles) {
     this.baseInstantTime = fileSlice.baseInstantTime;
     this.baseFile = fileSlice.baseFile != null ? new HoodieBaseFile(fileSlice.baseFile) : null;
     this.fileGroupId = fileSlice.fileGroupId;
     this.logFiles = new TreeSet<>(HoodieLogFile.getReverseLogFileComparator());
-    fileSlice.logFiles.forEach(lf -> this.logFiles.add(new HoodieLogFile(lf)));
+    if (includeLogFiles) {
+      fileSlice.logFiles.forEach(lf -> this.logFiles.add(new HoodieLogFile(lf)));
+    }
   }
 
   public FileSlice(String partitionPath, String baseInstantTime, String fileId) {
@@ -71,12 +79,37 @@ public class FileSlice implements Serializable {
     this.logFiles = new TreeSet<>(HoodieLogFile.getReverseLogFileComparator());
   }
 
+  public FileSlice(HoodieFileGroupId fileGroupId, String baseInstantTime,
+                   HoodieBaseFile baseFile, List<HoodieLogFile> logFiles) {
+    this.fileGroupId = fileGroupId;
+    this.baseInstantTime = baseInstantTime;
+    this.baseFile = baseFile;
+    this.logFiles = new TreeSet<>(HoodieLogFile.getReverseLogFileComparator());
+    this.logFiles.addAll(logFiles);
+  }
+
   public void setBaseFile(HoodieBaseFile baseFile) {
     this.baseFile = baseFile;
   }
 
   public void addLogFile(HoodieLogFile logFile) {
     this.logFiles.add(logFile);
+  }
+
+  public FileSlice withLogFiles(boolean includeLogFiles) {
+    if (includeLogFiles || !hasLogFiles()) {
+      return this;
+    } else {
+      return new FileSlice(this, false);
+    }
+  }
+
+  public boolean hasBootstrapBase() {
+    return getBaseFile().isPresent() && getBaseFile().get().getBootstrapBaseFile().isPresent();
+  }
+
+  public boolean hasLogFiles() {
+    return !logFiles.isEmpty();
   }
 
   public Stream<HoodieLogFile> getLogFiles() {
@@ -107,10 +140,21 @@ public class FileSlice implements Serializable {
     return Option.fromJavaOptional(logFiles.stream().findFirst());
   }
 
+  public long getTotalFileSize() {
+    return getBaseFile().map(HoodieBaseFile::getFileSize).orElse(0L)
+        + getLogFiles().mapToLong(HoodieLogFile::getFileSize).sum();
+  }
+
   /**
-   * Returns true if there is no data file and no log files. Happens as part of pending compaction
-   * 
-   * @return
+   * Returns the latest instant time of the file slice.
+   */
+  public String getLatestInstantTime() {
+    Option<String> latestDeltaCommitTime = getLatestLogFile().map(HoodieLogFile::getDeltaCommitTime);
+    return latestDeltaCommitTime.isPresent() ? InstantComparison.maxInstant(latestDeltaCommitTime.get(), getBaseInstantTime()) : getBaseInstantTime();
+  }
+
+  /**
+   * Returns true if there is no data file and no log files. Happens as part of pending compaction.
    */
   public boolean isEmpty() {
     return (baseFile == null) && (logFiles.isEmpty());

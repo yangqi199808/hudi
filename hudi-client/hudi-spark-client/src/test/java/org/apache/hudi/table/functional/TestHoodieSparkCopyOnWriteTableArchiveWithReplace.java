@@ -27,7 +27,8 @@ import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
 import org.apache.hudi.common.util.Option;
-import org.apache.hudi.config.HoodieCompactionConfig;
+import org.apache.hudi.config.HoodieArchivalConfig;
+import org.apache.hudi.config.HoodieCleanConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.testutils.SparkClientFunctionalTestHarness;
 
@@ -54,20 +55,21 @@ public class TestHoodieSparkCopyOnWriteTableArchiveWithReplace extends SparkClie
   public void testDeletePartitionAndArchive(boolean metadataEnabled) throws IOException {
     HoodieTableMetaClient metaClient = getHoodieMetaClient(HoodieTableType.COPY_ON_WRITE);
     HoodieWriteConfig writeConfig = getConfigBuilder(true)
-        .withCompactionConfig(HoodieCompactionConfig.newBuilder().archiveCommitsWith(2, 3).retainCommits(1).build())
+        .withCleanConfig(HoodieCleanConfig.newBuilder().retainCommits(1).build())
+        .withArchivalConfig(HoodieArchivalConfig.newBuilder().archiveCommitsWith(4, 5).build())
         .withMetadataConfig(HoodieMetadataConfig.newBuilder().enable(metadataEnabled).build())
         .build();
     try (SparkRDDWriteClient client = getHoodieWriteClient(writeConfig);
          HoodieTestDataGenerator dataGen = new HoodieTestDataGenerator(DEFAULT_PARTITION_PATHS)) {
 
       // 1st write batch; 3 commits for 3 partitions
-      String instantTime1 = HoodieActiveTimeline.createNewInstantTime(1000);
+      String instantTime1 = client.createNewInstantTime();
       client.startCommitWithTime(instantTime1);
       client.insert(jsc().parallelize(dataGen.generateInsertsForPartition(instantTime1, 10, DEFAULT_FIRST_PARTITION_PATH), 1), instantTime1);
-      String instantTime2 = HoodieActiveTimeline.createNewInstantTime(2000);
+      String instantTime2 = client.createNewInstantTime();
       client.startCommitWithTime(instantTime2);
       client.insert(jsc().parallelize(dataGen.generateInsertsForPartition(instantTime2, 10, DEFAULT_SECOND_PARTITION_PATH), 1), instantTime2);
-      String instantTime3 = HoodieActiveTimeline.createNewInstantTime(3000);
+      String instantTime3 = client.createNewInstantTime();
       client.startCommitWithTime(instantTime3);
       client.insert(jsc().parallelize(dataGen.generateInsertsForPartition(instantTime3, 1, DEFAULT_THIRD_PARTITION_PATH), 1), instantTime3);
 
@@ -75,13 +77,13 @@ public class TestHoodieSparkCopyOnWriteTableArchiveWithReplace extends SparkClie
       assertEquals(21, countRecordsOptionallySince(jsc(), basePath(), sqlContext(), timeline1, Option.empty()));
 
       // delete the 1st and the 2nd partition; 1 replace commit
-      final String instantTime4 = HoodieActiveTimeline.createNewInstantTime(4000);
+      final String instantTime4 = client.createNewInstantTime();
       client.startCommitWithTime(instantTime4, HoodieActiveTimeline.REPLACE_COMMIT_ACTION);
       client.deletePartitions(Arrays.asList(DEFAULT_FIRST_PARTITION_PATH, DEFAULT_SECOND_PARTITION_PATH), instantTime4);
 
-      // 2nd write batch; 4 commits for the 3rd partition; the 3rd commit to trigger archiving the replace commit
-      for (int i = 5; i < 9; i++) {
-        String instantTime = HoodieActiveTimeline.createNewInstantTime(i * 1000);
+      // 2nd write batch; 6 commits for the 4th partition; the 6th commit to trigger archiving the replace commit
+      for (int i = 5; i < 11; i++) {
+        String instantTime = client.createNewInstantTime();
         client.startCommitWithTime(instantTime);
         client.insert(jsc().parallelize(dataGen.generateInsertsForPartition(instantTime, 1, DEFAULT_THIRD_PARTITION_PATH), 1), instantTime);
       }
@@ -96,8 +98,8 @@ public class TestHoodieSparkCopyOnWriteTableArchiveWithReplace extends SparkClie
 
       // verify records
       final HoodieTimeline timeline2 = metaClient.getCommitTimeline().filterCompletedInstants();
-      assertEquals(5, countRecordsOptionallySince(jsc(), basePath(), sqlContext(), timeline2, Option.empty()),
-          "should only have the 4 records from the 3rd partition.");
+      assertEquals(7, countRecordsOptionallySince(jsc(), basePath(), sqlContext(), timeline2, Option.empty()),
+          "should only have the 7 records from the 3rd partition.");
     }
   }
 }

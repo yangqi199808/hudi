@@ -18,13 +18,11 @@
 
 package org.apache.hudi.common.model;
 
-import com.fasterxml.jackson.annotation.JsonAutoDetect;
+import org.apache.hudi.common.util.JsonUtils;
+
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-import com.fasterxml.jackson.annotation.PropertyAccessor;
-import com.fasterxml.jackson.databind.DeserializationFeature;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -33,15 +31,19 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.apache.hudi.common.table.timeline.MetadataConversionUtils.convertCommitMetadataToJsonBytes;
+import static org.apache.hudi.common.table.timeline.TimelineMetadataUtils.deserializeReplaceCommitMetadata;
+import static org.apache.hudi.common.util.StringUtils.fromUTF8Bytes;
+
 /**
  * All the metadata that gets stored along with a commit.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class HoodieReplaceCommitMetadata extends HoodieCommitMetadata {
-  private static final Logger LOG = LogManager.getLogger(HoodieReplaceCommitMetadata.class);
+  private static final Logger LOG = LoggerFactory.getLogger(HoodieReplaceCommitMetadata.class);
   protected Map<String, List<String>> partitionToReplaceFileIds;
 
-  // for ser/deser
+  // for serde
   public HoodieReplaceCommitMetadata() {
     this(false);
   }
@@ -62,10 +64,6 @@ public class HoodieReplaceCommitMetadata extends HoodieCommitMetadata {
     partitionToReplaceFileIds.get(partitionPath).add(fileId);
   }
 
-  public List<String> getReplaceFileIds(String partitionPath) {
-    return partitionToReplaceFileIds.get(partitionPath);
-  }
-
   public Map<String, List<String>> getPartitionToReplaceFileIds() {
     return partitionToReplaceFileIds;
   }
@@ -80,15 +78,15 @@ public class HoodieReplaceCommitMetadata extends HoodieCommitMetadata {
       LOG.info("partition path is null for " + partitionToReplaceFileIds.get(null));
       partitionToReplaceFileIds.remove(null);
     }
-    return getObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(this);
+    return JsonUtils.getObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(this);
   }
 
   public static <T> T fromJsonString(String jsonStr, Class<T> clazz) throws Exception {
     if (jsonStr == null || jsonStr.isEmpty()) {
-      // For empty commit file (no data or somethings bad happen).
+      // For empty commit file
       return clazz.newInstance();
     }
-    return getObjectMapper().readValue(jsonStr, clazz);
+    return JsonUtils.getObjectMapper().readValue(jsonStr, clazz);
   }
 
   @Override
@@ -101,12 +99,10 @@ public class HoodieReplaceCommitMetadata extends HoodieCommitMetadata {
     }
 
     HoodieReplaceCommitMetadata that = (HoodieReplaceCommitMetadata) o;
-
     if (!partitionToWriteStats.equals(that.partitionToWriteStats)) {
       return false;
     }
     return compacted.equals(that.compacted);
-
   }
 
   @Override
@@ -118,17 +114,19 @@ public class HoodieReplaceCommitMetadata extends HoodieCommitMetadata {
 
   public static <T> T fromBytes(byte[] bytes, Class<T> clazz) throws IOException {
     try {
-      return fromJsonString(new String(bytes, StandardCharsets.UTF_8), clazz);
+      if (bytes.length == 0) {
+        return clazz.newInstance();
+      }
+      try {
+        return fromJsonString(fromUTF8Bytes(convertCommitMetadataToJsonBytes(deserializeReplaceCommitMetadata(bytes), org.apache.hudi.avro.model.HoodieReplaceCommitMetadata.class)), clazz);
+      } catch (Exception e) {
+        // fall back to the alternative method (0.x)
+        LOG.warn("Primary method failed; trying alternative deserialization method.", e);
+        return fromJsonString(new String(bytes, StandardCharsets.UTF_8), clazz);
+      }
     } catch (Exception e) {
-      throw new IOException("unable to read commit metadata", e);
+      throw new IOException("unable to read commit metadata for bytes length: " + bytes.length, e);
     }
-  }
-
-  protected static ObjectMapper getObjectMapper() {
-    ObjectMapper mapper = new ObjectMapper();
-    mapper.disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
-    mapper.setVisibility(PropertyAccessor.FIELD, JsonAutoDetect.Visibility.ANY);
-    return mapper;
   }
 
   @Override

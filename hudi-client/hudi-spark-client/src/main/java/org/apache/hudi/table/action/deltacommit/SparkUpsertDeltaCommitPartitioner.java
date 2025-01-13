@@ -19,11 +19,11 @@
 package org.apache.hudi.table.action.deltacommit;
 
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
-import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.FileSlice;
+import org.apache.hudi.common.model.HoodieBaseFile;
 import org.apache.hudi.common.model.HoodieLogFile;
 import org.apache.hudi.common.model.HoodieRecordLocation;
-import org.apache.hudi.common.model.HoodieRecordPayload;
+import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.config.HoodieWriteConfig;
@@ -33,6 +33,7 @@ import org.apache.hudi.table.action.commit.SmallFile;
 import org.apache.hudi.table.action.commit.UpsertPartitioner;
 
 import javax.annotation.Nonnull;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -43,11 +44,11 @@ import java.util.stream.Collectors;
  * UpsertPartitioner for MergeOnRead table type, this allows auto correction of small parquet files to larger ones
  * without the need for an index in the logFile.
  */
-public class SparkUpsertDeltaCommitPartitioner<T extends HoodieRecordPayload<T>> extends UpsertPartitioner<T> {
+public class SparkUpsertDeltaCommitPartitioner<T> extends UpsertPartitioner<T> {
 
   public SparkUpsertDeltaCommitPartitioner(WorkloadProfile profile, HoodieSparkEngineContext context, HoodieTable table,
-                                           HoodieWriteConfig config) {
-    super(profile, context, table, config);
+                                           HoodieWriteConfig config, WriteOperationType operationType) {
+    super(profile, context, table, config, operationType);
   }
 
   @Override
@@ -70,15 +71,14 @@ public class SparkUpsertDeltaCommitPartitioner<T extends HoodieRecordPayload<T>>
     for (FileSlice smallFileSlice : smallFileSlicesCandidates) {
       SmallFile sf = new SmallFile();
       if (smallFileSlice.getBaseFile().isPresent()) {
-        // TODO : Move logic of file name, file id, base commit time handling inside file slice
-        String filename = smallFileSlice.getBaseFile().get().getFileName();
-        sf.location = new HoodieRecordLocation(FSUtils.getCommitTime(filename), FSUtils.getFileId(filename));
+        HoodieBaseFile baseFile = smallFileSlice.getBaseFile().get();
+        sf.location = new HoodieRecordLocation(baseFile.getCommitTime(), baseFile.getFileId());
         sf.sizeBytes = getTotalFileSize(smallFileSlice);
         smallFileLocations.add(sf);
       } else {
         HoodieLogFile logFile = smallFileSlice.getLogFiles().findFirst().get();
-        sf.location = new HoodieRecordLocation(FSUtils.getBaseCommitTimeFromLogPath(logFile.getPath()),
-            FSUtils.getFileIdFromLogPath(logFile.getPath()));
+        sf.location = new HoodieRecordLocation(logFile.getDeltaCommitTime(),
+            logFile.getFileId());
         sf.sizeBytes = getTotalFileSize(smallFileSlice);
         smallFileLocations.add(sf);
       }
@@ -92,7 +92,7 @@ public class SparkUpsertDeltaCommitPartitioner<T extends HoodieRecordPayload<T>>
     // pending compaction
     if (table.getIndex().canIndexLogFiles()) {
       return table.getSliceView()
-              .getLatestFileSlicesBeforeOrOn(partitionPath, latestCommitInstant.getTimestamp(), false)
+              .getLatestFileSlicesBeforeOrOn(partitionPath, latestCommitInstant.requestedTime(), false)
               .filter(this::isSmallFile)
               .collect(Collectors.toList());
     }
@@ -104,7 +104,7 @@ public class SparkUpsertDeltaCommitPartitioner<T extends HoodieRecordPayload<T>>
     // If we cannot index log files, then we choose the smallest parquet file in the partition and add inserts to
     // it. Doing this overtime for a partition, we ensure that we handle small file issues
     return table.getSliceView()
-          .getLatestFileSlicesBeforeOrOn(partitionPath, latestCommitInstant.getTimestamp(), false)
+          .getLatestFileSlicesBeforeOrOn(partitionPath, latestCommitInstant.requestedTime(), false)
           .filter(
               fileSlice ->
                   // NOTE: We can not pad slices with existing log-files w/o compacting these,

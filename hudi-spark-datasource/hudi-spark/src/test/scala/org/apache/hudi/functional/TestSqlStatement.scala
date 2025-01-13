@@ -18,9 +18,10 @@
 package org.apache.hudi.functional
 
 import org.apache.hudi.common.util.FileIOUtils
-import org.apache.spark.sql.hudi.TestHoodieSqlBase
 
-class TestSqlStatement extends TestHoodieSqlBase {
+import org.apache.spark.sql.hudi.common.HoodieSparkSqlTestBase
+
+class TestSqlStatement extends HoodieSparkSqlTestBase {
   val STATE_INIT = 0
   val STATE_SKIP_COMMENT = 1
   val STATE_FINISH_COMMENT = 2
@@ -40,7 +41,9 @@ class TestSqlStatement extends TestHoodieSqlBase {
       withTempDir { tmp =>
         val params = Map(
           "tableType" -> tableType,
-          "tmpDir" -> tmp.getCanonicalPath
+          "tmpDir" -> {
+            tmp.getCanonicalPath.replace('\\', '/')
+          }
         )
         execSqlFile("/sql-statements.sql", params)
       }

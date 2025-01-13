@@ -23,10 +23,9 @@ import org.apache.hudi.ApiMaturityLevel;
 import org.apache.hudi.PublicAPIMethod;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.common.data.HoodieData;
-import org.apache.hudi.common.data.HoodieList;
+import org.apache.hudi.common.data.HoodieListData;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.model.HoodieRecord;
-import org.apache.hudi.common.model.HoodieRecordPayload;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieIndexException;
 import org.apache.hudi.table.HoodieTable;
@@ -37,7 +36,7 @@ import java.util.stream.Collectors;
 /**
  * Base flink implementation of {@link HoodieIndex}.
  */
-public abstract class FlinkHoodieIndex<T extends HoodieRecordPayload> extends HoodieIndex<List<HoodieRecord<T>>, List<WriteStatus>> {
+public abstract class FlinkHoodieIndex<T> extends HoodieIndex<List<HoodieRecord<T>>, List<WriteStatus>> {
   protected FlinkHoodieIndex(HoodieWriteConfig config) {
     super(config);
   }
@@ -61,8 +60,8 @@ public abstract class FlinkHoodieIndex<T extends HoodieRecordPayload> extends Ho
   public <R> HoodieData<HoodieRecord<R>> tagLocation(
       HoodieData<HoodieRecord<R>> records, HoodieEngineContext context,
       HoodieTable hoodieTable) throws HoodieIndexException {
-    List<HoodieRecord<T>> hoodieRecords = tagLocation(HoodieList.getList(records.map(record -> (HoodieRecord<T>) record)), context, hoodieTable);
-    return HoodieList.of(hoodieRecords.stream().map(r -> (HoodieRecord<R>) r).collect(Collectors.toList()));
+    List<HoodieRecord<T>> hoodieRecords = tagLocation(records.map(record -> (HoodieRecord<T>) record).collectAsList(), context, hoodieTable);
+    return HoodieListData.eager(hoodieRecords.stream().map(r -> (HoodieRecord<R>) r).collect(Collectors.toList()));
   }
 
   @Override
@@ -70,6 +69,6 @@ public abstract class FlinkHoodieIndex<T extends HoodieRecordPayload> extends Ho
   public HoodieData<WriteStatus> updateLocation(
       HoodieData<WriteStatus> writeStatuses, HoodieEngineContext context,
       HoodieTable hoodieTable) throws HoodieIndexException {
-    return HoodieList.of(updateLocation(HoodieList.getList(writeStatuses), context, hoodieTable));
+    return HoodieListData.eager(updateLocation(writeStatuses.collectAsList(), context, hoodieTable));
   }
 }
