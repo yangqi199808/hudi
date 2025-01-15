@@ -21,13 +21,16 @@ package org.apache.hudi.sink.common;
 import org.apache.hudi.client.HoodieFlinkWriteClient;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.ValidationUtils;
 import org.apache.hudi.configuration.FlinkOptions;
 import org.apache.hudi.sink.StreamWriteOperatorCoordinator;
 import org.apache.hudi.sink.event.CommitAckEvent;
 import org.apache.hudi.sink.event.WriteMetadataEvent;
 import org.apache.hudi.sink.meta.CkpMetadata;
+import org.apache.hudi.sink.meta.CkpMetadataFactory;
 import org.apache.hudi.sink.utils.TimeWait;
+import org.apache.hudi.util.FlinkWriteClients;
 import org.apache.hudi.util.StreamerUtil;
 
 import org.apache.flink.annotation.VisibleForTesting;
@@ -45,7 +48,6 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Objects;
 
 /**
  * Base infrastructures for streaming writer function.
@@ -121,6 +123,12 @@ public abstract class AbstractStreamWriteFunction<I>
   private transient CkpMetadata ckpMetadata;
 
   /**
+   * Since flink 1.15, the streaming job with bounded source triggers one checkpoint
+   * after calling #endInput, use this flag to avoid unnecessary data flush.
+   */
+  private transient boolean inputEnded;
+
+  /**
    * Constructs a StreamWriteFunctionBase.
    *
    * @param config The config options
@@ -133,7 +141,7 @@ public abstract class AbstractStreamWriteFunction<I>
   public void initializeState(FunctionInitializationContext context) throws Exception {
     this.taskID = getRuntimeContext().getIndexOfThisSubtask();
     this.metaClient = StreamerUtil.createMetaClient(this.config);
-    this.writeClient = StreamerUtil.createWriteClient(this.config, getRuntimeContext());
+    this.writeClient = FlinkWriteClients.createWriteClient(this.config, getRuntimeContext());
     this.writeStatuses = new ArrayList<>();
     this.writeMetadataState = context.getOperatorStateStore().getListState(
         new ListStateDescriptor<>(
@@ -141,7 +149,7 @@ public abstract class AbstractStreamWriteFunction<I>
             TypeInformation.of(WriteMetadataEvent.class)
         ));
 
-    this.ckpMetadata = CkpMetadata.getInstance(this.metaClient.getFs(), this.metaClient.getBasePath());
+    this.ckpMetadata = CkpMetadataFactory.getCkpMetadata(writeClient.getConfig(), config);
     this.currentInstant = lastPendingInstant();
     if (context.isRestored()) {
       restoreWriteMetadata();
@@ -154,12 +162,20 @@ public abstract class AbstractStreamWriteFunction<I>
 
   @Override
   public void snapshotState(FunctionSnapshotContext functionSnapshotContext) throws Exception {
+    if (inputEnded) {
+      return;
+    }
     snapshotState();
     // Reload the snapshot state as the current state.
     reloadWriteMetaState();
   }
 
   public abstract void snapshotState();
+
+  @Override
+  public void endInput() {
+    this.inputEnded = true;
+  }
 
   // -------------------------------------------------------------------------
   //  Getter/Setter
@@ -178,10 +194,14 @@ public abstract class AbstractStreamWriteFunction<I>
   // -------------------------------------------------------------------------
 
   private void restoreWriteMetadata() throws Exception {
-    String lastInflight = lastPendingInstant();
     boolean eventSent = false;
+    HoodieTimeline pendingTimeline = this.metaClient.getActiveTimeline().filterPendingExcludingCompaction();
     for (WriteMetadataEvent event : this.writeMetadataState.get()) {
-      if (Objects.equals(lastInflight, event.getInstantTime())) {
+      // Must filter out the completed instants in case it is a partial failover,
+      // the write status should not be accumulated in such case.
+      if (pendingTimeline.containsInstant(event.getInstantTime())) {
+        // Reset taskID for event
+        event.setTaskID(taskID);
         // The checkpoint succeed but the meta does not commit,
         // re-commit the inflight instant
         this.eventGateway.sendEventToCoordinator(event);
@@ -194,7 +214,7 @@ public abstract class AbstractStreamWriteFunction<I>
     }
   }
 
-  private void sendBootstrapEvent() {
+  protected void sendBootstrapEvent() {
     this.eventGateway.sendEventToCoordinator(WriteMetadataEvent.emptyBootstrap(taskID));
     LOG.info("Send bootstrap write metadata event to coordinator, task[{}].", taskID);
   }
@@ -245,7 +265,7 @@ public abstract class AbstractStreamWriteFunction<I>
       // wait condition:
       // 1. there is no inflight instant
       // 2. the inflight instant does not change and the checkpoint has buffering data
-      if (instant == null || (instant.equals(this.currentInstant) && hasData && !this.ckpMetadata.isAborted(instant))) {
+      if (instant == null || invalidInstant(instant, hasData)) {
         // sleep for a while
         timeWait.waitFor();
         // refresh the inflight instant
@@ -257,5 +277,12 @@ public abstract class AbstractStreamWriteFunction<I>
       }
     }
     return instant;
+  }
+
+  /**
+   * Returns whether the pending instant is invalid to write with.
+   */
+  private boolean invalidInstant(String instant, boolean hasData) {
+    return instant.equals(this.currentInstant) && hasData;
   }
 }

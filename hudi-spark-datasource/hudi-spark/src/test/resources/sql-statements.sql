@@ -1,3 +1,18 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"), you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # SET OPTION
 set hoodie.insert.shuffle.parallelism = 1;
@@ -19,6 +34,7 @@ set hoodie.delete.shuffle.parallelism = 1;
 # CTAS
 
 create table h0 using hudi options(type = '${tableType}', primaryKey = 'id')
+location '${tmpDir}/h0'
 as select 1 as id, 'a1' as name, 10 as price;
 +----------+
 | ok       |
@@ -31,6 +47,7 @@ select id, name, price from h0;
 
 create table h0_p using hudi partitioned by(dt)
 options(type = '${tableType}', primaryKey = 'id')
+location '${tmpDir}/h0_p'
 as select cast('2021-05-07 00:00:00' as timestamp) as dt,
  1 as id, 'a1' as name, 10 as price;
 +----------+
@@ -191,7 +208,7 @@ using (
   select 5 as _id, 'a5' as _name, 10 as _price, 1000 as _ts, '2021-05-08' as dt
 ) s0
 on s0._id = t0.id
-when matched then update set *
+when matched then update set id = _id, name = _name, price = _price, ts = _ts, dt = s0.dt
 when not matched then insert (id, name, price, ts, dt) values(_id, _name, _price, _ts, s0.dt);
 +----------+
 | ok       |
@@ -214,10 +231,10 @@ using (
   select 6 as id, '_insert' as name, 10 as price, 1000 as ts, '2021-05-08' as dt
 ) s0
 on s0.id = t0.id
-when matched and name = '_update'
+when matched and s0.name = '_update'
   then update set id = s0.id, name = s0.name, price = s0.price, ts = s0.ts, dt = s0.dt
-when matched and name = '_delete' then delete
-when not matched and name = '_insert' then insert *;
+when matched and s0.name = '_delete' then delete
+when not matched and s0.name = '_insert' then insert *;
 +----------+
 | ok       |
 +----------+

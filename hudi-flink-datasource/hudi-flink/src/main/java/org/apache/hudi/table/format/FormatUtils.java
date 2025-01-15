@@ -18,21 +18,31 @@
 
 package org.apache.hudi.table.format;
 
-import org.apache.hudi.common.fs.FSUtils;
+import org.apache.hudi.common.config.ConfigProperty;
+import org.apache.hudi.common.config.HoodieMemoryConfig;
+import org.apache.hudi.common.engine.EngineType;
 import org.apache.hudi.common.model.HoodieOperation;
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.model.HoodieRecordMerger;
 import org.apache.hudi.common.table.log.HoodieMergedLogRecordScanner;
 import org.apache.hudi.common.table.log.HoodieUnMergedLogRecordScanner;
 import org.apache.hudi.common.util.DefaultSizeEstimator;
 import org.apache.hudi.common.util.Functions;
+import org.apache.hudi.common.util.HoodieRecordUtils;
 import org.apache.hudi.common.util.Option;
+import org.apache.hudi.common.util.collection.ExternalSpillableMap;
 import org.apache.hudi.common.util.queue.BoundedInMemoryExecutor;
-import org.apache.hudi.common.util.queue.BoundedInMemoryQueueProducer;
 import org.apache.hudi.common.util.queue.FunctionBasedQueueProducer;
+import org.apache.hudi.common.util.queue.HoodieProducer;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.configuration.FlinkOptions;
-import org.apache.hudi.hadoop.config.HoodieRealtimeConfig;
+import org.apache.hudi.exception.HoodieIOException;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
+import org.apache.hudi.internal.schema.InternalSchema;
+import org.apache.hudi.storage.HoodieStorage;
+import org.apache.hudi.storage.HoodieStorageUtils;
 import org.apache.hudi.table.format.mor.MergeOnReadInputSplit;
+import org.apache.hudi.util.FlinkWriteClients;
 import org.apache.hudi.util.StreamerUtil;
 
 import org.apache.avro.Schema;
@@ -42,15 +52,15 @@ import org.apache.avro.generic.IndexedRecord;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.types.RowKind;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Utilities for format.
@@ -119,57 +129,48 @@ public class FormatUtils {
     return pos == -1 ? null : record.get(pos);
   }
 
+  public static ExternalSpillableMap<String, byte[]> spillableMap(
+      HoodieWriteConfig writeConfig,
+      long maxCompactionMemoryInBytes) {
+    try {
+      return new ExternalSpillableMap<>(
+          maxCompactionMemoryInBytes,
+          writeConfig.getSpillableMapBasePath(),
+          new DefaultSizeEstimator<>(),
+          new DefaultSizeEstimator<>(),
+          writeConfig.getCommonConfig().getSpillableDiskMapType(),
+          writeConfig.getCommonConfig().isBitCaskDiskMapCompressionEnabled());
+    } catch (IOException e) {
+      throw new HoodieIOException(
+          "IOException when creating ExternalSpillableMap at " + writeConfig.getSpillableMapBasePath(), e);
+    }
+  }
+
   public static HoodieMergedLogRecordScanner logScanner(
       MergeOnReadInputSplit split,
       Schema logSchema,
-      Configuration config,
-      boolean withOperationField) {
-    FileSystem fs = FSUtils.getFs(split.getTablePath(), config);
+      InternalSchema internalSchema,
+      org.apache.flink.configuration.Configuration flinkConf,
+      Configuration hadoopConf) {
+    HoodieWriteConfig writeConfig = FlinkWriteClients.getHoodieClientConfig(flinkConf);
+    HoodieStorage storage = HoodieStorageUtils.getStorage(
+        split.getTablePath(), HadoopFSUtils.getStorageConf(hadoopConf));
     return HoodieMergedLogRecordScanner.newBuilder()
-        .withFileSystem(fs)
+        .withStorage(storage)
         .withBasePath(split.getTablePath())
         .withLogFilePaths(split.getLogPaths().get())
         .withReaderSchema(logSchema)
+        .withInternalSchema(internalSchema)
         .withLatestInstantTime(split.getLatestCommit())
-        .withReadBlocksLazily(
-            string2Boolean(
-                config.get(HoodieRealtimeConfig.COMPACTION_LAZY_BLOCK_READ_ENABLED_PROP,
-                    HoodieRealtimeConfig.DEFAULT_COMPACTION_LAZY_BLOCK_READ_ENABLED)))
         .withReverseReader(false)
-        .withBufferSize(
-            config.getInt(HoodieRealtimeConfig.MAX_DFS_STREAM_BUFFER_SIZE_PROP,
-                HoodieRealtimeConfig.DEFAULT_MAX_DFS_STREAM_BUFFER_SIZE))
+        .withBufferSize(writeConfig.getMaxDFSStreamBufferSize())
         .withMaxMemorySizeInBytes(split.getMaxCompactionMemoryInBytes())
-        .withSpillableMapBasePath(
-            config.get(HoodieRealtimeConfig.SPILLABLE_MAP_BASE_PATH_PROP,
-                HoodieRealtimeConfig.DEFAULT_SPILLABLE_MAP_BASE_PATH))
+        .withDiskMapType(writeConfig.getCommonConfig().getSpillableDiskMapType())
+        .withBitCaskDiskMapCompressionEnabled(writeConfig.getCommonConfig().isBitCaskDiskMapCompressionEnabled())
+        .withSpillableMapBasePath(writeConfig.getSpillableMapBasePath())
         .withInstantRange(split.getInstantRange())
-        .withOperationField(withOperationField)
-        .build();
-  }
-
-  private static HoodieUnMergedLogRecordScanner unMergedLogScanner(
-      MergeOnReadInputSplit split,
-      Schema logSchema,
-      Configuration config,
-      HoodieUnMergedLogRecordScanner.LogRecordScannerCallback callback) {
-    FileSystem fs = FSUtils.getFs(split.getTablePath(), config);
-    return HoodieUnMergedLogRecordScanner.newBuilder()
-        .withFileSystem(fs)
-        .withBasePath(split.getTablePath())
-        .withLogFilePaths(split.getLogPaths().get())
-        .withReaderSchema(logSchema)
-        .withLatestInstantTime(split.getLatestCommit())
-        .withReadBlocksLazily(
-            string2Boolean(
-                config.get(HoodieRealtimeConfig.COMPACTION_LAZY_BLOCK_READ_ENABLED_PROP,
-                    HoodieRealtimeConfig.DEFAULT_COMPACTION_LAZY_BLOCK_READ_ENABLED)))
-        .withReverseReader(false)
-        .withBufferSize(
-            config.getInt(HoodieRealtimeConfig.MAX_DFS_STREAM_BUFFER_SIZE_PROP,
-                HoodieRealtimeConfig.DEFAULT_MAX_DFS_STREAM_BUFFER_SIZE))
-        .withInstantRange(split.getInstantRange())
-        .withLogRecordScannerCallback(callback)
+        .withOperationField(flinkConf.getBoolean(FlinkOptions.CHANGELOG_ENABLED))
+        .withRecordMerger(writeConfig.getRecordMerger())
         .build();
   }
 
@@ -177,9 +178,6 @@ public class FormatUtils {
    * Utility to read and buffer the records in the unMerged log record scanner.
    */
   public static class BoundedMemoryRecords {
-    // Log Record unmerged scanner
-    private final HoodieUnMergedLogRecordScanner scanner;
-
     // Executor that runs the above producers in parallel
     private final BoundedInMemoryExecutor<HoodieRecord<?>, HoodieRecord<?>, ?> executor;
 
@@ -189,21 +187,42 @@ public class FormatUtils {
     public BoundedMemoryRecords(
         MergeOnReadInputSplit split,
         Schema logSchema,
+        InternalSchema internalSchema,
         Configuration hadoopConf,
         org.apache.flink.configuration.Configuration flinkConf) {
+      List<String> mergers = Arrays.stream(flinkConf.getString(FlinkOptions.RECORD_MERGER_IMPLS).split(","))
+          .map(String::trim)
+          .distinct()
+          .collect(Collectors.toList());
+      HoodieRecordMerger merger = HoodieRecordUtils.createRecordMerger(
+          split.getTablePath(), EngineType.FLINK, mergers, flinkConf.getString(FlinkOptions.RECORD_MERGER_STRATEGY_ID));
+      HoodieUnMergedLogRecordScanner.Builder scannerBuilder =
+          HoodieUnMergedLogRecordScanner.newBuilder()
+              .withStorage(HoodieStorageUtils.getStorage(
+                  split.getTablePath(), HadoopFSUtils.getStorageConf(hadoopConf)))
+          .withBasePath(split.getTablePath())
+          .withLogFilePaths(split.getLogPaths().get())
+          .withReaderSchema(logSchema)
+          .withInternalSchema(internalSchema)
+          .withLatestInstantTime(split.getLatestCommit())
+          .withReverseReader(false)
+          .withBufferSize(
+              flinkConf.getInteger(HoodieMemoryConfig.MAX_DFS_STREAM_BUFFER_SIZE.key(),
+                  HoodieMemoryConfig.DEFAULT_MR_MAX_DFS_STREAM_BUFFER_SIZE))
+          .withInstantRange(split.getInstantRange())
+          .withRecordMerger(merger);
+
       this.executor = new BoundedInMemoryExecutor<>(
           StreamerUtil.getMaxCompactionMemoryInBytes(flinkConf),
-          getParallelProducers(),
+          getParallelProducers(scannerBuilder),
           Option.empty(),
           Function.identity(),
           new DefaultSizeEstimator<>(),
           Functions.noop());
-      // Consumer of this record reader
-      this.iterator = this.executor.getQueue().iterator();
-      this.scanner = FormatUtils.unMergedLogScanner(split, logSchema, hadoopConf,
-          record -> executor.getQueue().insertRecord(record));
+      this.iterator = this.executor.getRecordIterator();
+
       // Start reading and buffering
-      this.executor.startProducers();
+      this.executor.startProducingAsync();
     }
 
     public Iterator<HoodieRecord<?>> getRecordsIterator() {
@@ -213,12 +232,18 @@ public class FormatUtils {
     /**
      * Setup log and parquet reading in parallel. Both write to central buffer.
      */
-    private List<BoundedInMemoryQueueProducer<HoodieRecord<?>>> getParallelProducers() {
-      List<BoundedInMemoryQueueProducer<HoodieRecord<?>>> producers = new ArrayList<>();
-      producers.add(new FunctionBasedQueueProducer<>(buffer -> {
+    private List<HoodieProducer<HoodieRecord<?>>> getParallelProducers(
+        HoodieUnMergedLogRecordScanner.Builder scannerBuilder
+    ) {
+      List<HoodieProducer<HoodieRecord<?>>> producers = new ArrayList<>();
+      producers.add(new FunctionBasedQueueProducer<>(queue -> {
+        HoodieUnMergedLogRecordScanner scanner =
+            scannerBuilder.withLogRecordScannerCallback(queue::insertRecord).build();
+        // Scan all the delta-log files, filling in the queue
         scanner.scan();
         return null;
       }));
+
       return producers;
     }
 
@@ -235,32 +260,62 @@ public class FormatUtils {
       Configuration hadoopConf) {
     String basePath = writeConfig.getBasePath();
     return HoodieMergedLogRecordScanner.newBuilder()
-        .withFileSystem(FSUtils.getFs(basePath, hadoopConf))
+        .withStorage(HoodieStorageUtils.getStorage(
+            basePath, HadoopFSUtils.getStorageConf(hadoopConf)))
         .withBasePath(basePath)
         .withLogFilePaths(logPaths)
         .withReaderSchema(logSchema)
         .withLatestInstantTime(latestInstantTime)
-        .withReadBlocksLazily(writeConfig.getCompactionLazyBlockReadEnabled())
         .withReverseReader(false)
         .withBufferSize(writeConfig.getMaxDFSStreamBufferSize())
         .withMaxMemorySizeInBytes(writeConfig.getMaxMemoryPerPartitionMerge())
         .withSpillableMapBasePath(writeConfig.getSpillableMapBasePath())
         .withDiskMapType(writeConfig.getCommonConfig().getSpillableDiskMapType())
         .withBitCaskDiskMapCompressionEnabled(writeConfig.getCommonConfig().isBitCaskDiskMapCompressionEnabled())
+        .withRecordMerger(writeConfig.getRecordMerger())
         .build();
+  }
+
+  /**
+   * Gets the raw value for a {@link ConfigProperty} config from Flink configuration. The key and
+   * alternative keys are used to fetch the config.
+   *
+   * @param flinkConf      Configs in Flink {@link org.apache.flink.configuration.Configuration}.
+   * @param configProperty {@link ConfigProperty} config to fetch.
+   * @return {@link Option} of value if the config exists; empty {@link Option} otherwise.
+   */
+  public static Option<String> getRawValueWithAltKeys(org.apache.flink.configuration.Configuration flinkConf,
+                                                      ConfigProperty<?> configProperty) {
+    if (flinkConf.containsKey(configProperty.key())) {
+      return Option.ofNullable(flinkConf.getString(configProperty.key(), ""));
+    }
+    for (String alternative : configProperty.getAlternatives()) {
+      if (flinkConf.containsKey(alternative)) {
+        return Option.ofNullable(flinkConf.getString(alternative, ""));
+      }
+    }
+    return Option.empty();
+  }
+
+  /**
+   * Gets the boolean value for a {@link ConfigProperty} config from Flink configuration. The key and
+   * alternative keys are used to fetch the config. The default value of {@link ConfigProperty}
+   * config, if exists, is returned if the config is not found in the configuration.
+   *
+   * @param conf           Configs in Flink {@link Configuration}.
+   * @param configProperty {@link ConfigProperty} config to fetch.
+   * @return boolean value if the config exists; default boolean value if the config does not exist
+   * and there is default value defined in the {@link ConfigProperty} config; {@code false} otherwise.
+   */
+  public static boolean getBooleanWithAltKeys(org.apache.flink.configuration.Configuration conf,
+                                              ConfigProperty<?> configProperty) {
+    Option<String> rawValue = getRawValueWithAltKeys(conf, configProperty);
+    boolean defaultValue = configProperty.hasDefaultValue()
+        ? Boolean.parseBoolean(configProperty.defaultValue().toString()) : false;
+    return rawValue.map(Boolean::parseBoolean).orElse(defaultValue);
   }
 
   private static Boolean string2Boolean(String s) {
     return "true".equals(s.toLowerCase(Locale.ROOT));
-  }
-
-  public static org.apache.hadoop.conf.Configuration getParquetConf(
-      org.apache.flink.configuration.Configuration options,
-      org.apache.hadoop.conf.Configuration hadoopConf) {
-    final String prefix = "parquet.";
-    org.apache.hadoop.conf.Configuration copy = new org.apache.hadoop.conf.Configuration(hadoopConf);
-    Map<String, String> parquetOptions = FlinkOptions.getHoodiePropertiesWithPrefix(options.toMap(), prefix);
-    parquetOptions.forEach((k, v) -> copy.set(prefix + k, v));
-    return copy;
   }
 }

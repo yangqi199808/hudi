@@ -18,6 +18,7 @@
 
 package org.apache.hudi.sink;
 
+import org.apache.hudi.adapter.OperatorCoordinatorAdapter;
 import org.apache.hudi.client.HoodieFlinkWriteClient;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.common.model.HoodieTableType;
@@ -27,16 +28,24 @@ import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.CommitUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ValidationUtils;
+import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.configuration.FlinkOptions;
+import org.apache.hudi.configuration.HadoopConfigurations;
 import org.apache.hudi.configuration.OptionsResolver;
 import org.apache.hudi.exception.HoodieException;
+import org.apache.hudi.hadoop.fs.HadoopFSUtils;
+import org.apache.hudi.hive.HiveSyncTool;
 import org.apache.hudi.sink.event.CommitAckEvent;
 import org.apache.hudi.sink.event.WriteMetadataEvent;
 import org.apache.hudi.sink.meta.CkpMetadata;
+import org.apache.hudi.sink.meta.CkpMetadataFactory;
 import org.apache.hudi.sink.utils.HiveSyncContext;
 import org.apache.hudi.sink.utils.NonThrownExecutor;
+import org.apache.hudi.storage.StorageConfiguration;
+import org.apache.hudi.util.ClientIds;
+import org.apache.hudi.util.ClusteringUtil;
 import org.apache.hudi.util.CompactionUtil;
-import org.apache.hudi.util.StreamerUtil;
+import org.apache.hudi.util.FlinkWriteClients;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.configuration.Configuration;
@@ -44,10 +53,12 @@ import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.operators.coordination.OperatorCoordinator;
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
 import org.apache.flink.runtime.operators.coordination.TaskNotRunningException;
-import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
+import java.io.IOException;
 import java.io.Serializable;
 import java.util.Arrays;
 import java.util.Collection;
@@ -61,6 +72,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.stream.Collectors;
 
+import static org.apache.hudi.common.table.timeline.InstantComparison.GREATER_THAN_OR_EQUALS;
+import static org.apache.hudi.common.table.timeline.InstantComparison.compareTimestamps;
 import static org.apache.hudi.util.StreamerUtil.initTableIfNotExists;
 
 /**
@@ -74,13 +87,18 @@ import static org.apache.hudi.util.StreamerUtil.initTableIfNotExists;
  * @see StreamWriteFunction for the work flow and semantics
  */
 public class StreamWriteOperatorCoordinator
-    implements OperatorCoordinator {
+    implements OperatorCoordinatorAdapter {
   private static final Logger LOG = LoggerFactory.getLogger(StreamWriteOperatorCoordinator.class);
 
   /**
    * Config options.
    */
   private final Configuration conf;
+
+  /**
+   * Hive config options.
+   */
+  private final StorageConfiguration<org.apache.hadoop.conf.Configuration> storageConf;
 
   /**
    * Coordinator context.
@@ -144,9 +162,9 @@ public class StreamWriteOperatorCoordinator
   private CkpMetadata ckpMetadata;
 
   /**
-   * Current checkpoint.
+   * The client id heartbeats.
    */
-  private long checkpointId = -1;
+  private ClientIds clientIds;
 
   /**
    * Constructs a StreamingSinkOperatorCoordinator.
@@ -160,6 +178,7 @@ public class StreamWriteOperatorCoordinator
     this.conf = conf;
     this.context = context;
     this.parallelism = context.currentParallelism();
+    this.storageConf = HadoopFSUtils.getStorageConfWithCopy(HadoopConfigurations.getHiveConf(conf));
   }
 
   @Override
@@ -173,7 +192,9 @@ public class StreamWriteOperatorCoordinator
     // init table, create if not exists.
     this.metaClient = initTableIfNotExists(this.conf);
     // the write client must create after the table creation
-    this.writeClient = StreamerUtil.createWriteClient(conf);
+    this.writeClient = FlinkWriteClients.createWriteClient(conf);
+    this.ckpMetadata = initCkpMetadata(writeClient.getConfig(), this.conf);
+    initMetadataTable(this.writeClient);
     this.tableState = TableState.create(conf);
     // start the executor
     this.executor = NonThrownExecutor.builder(LOG)
@@ -183,11 +204,10 @@ public class StreamWriteOperatorCoordinator
     if (tableState.syncHive) {
       initHiveSync();
     }
-    if (tableState.syncMetadata) {
-      initMetadataSync();
+    // start client id heartbeats for optimistic concurrency control
+    if (OptionsResolver.isMultiWriter(conf)) {
+      initClientIds(conf);
     }
-    this.ckpMetadata = CkpMetadata.getInstance(this.metaClient.getFs(), metaClient.getBasePath());
-    this.ckpMetadata.bootstrap(this.metaClient);
   }
 
   @Override
@@ -208,11 +228,13 @@ public class StreamWriteOperatorCoordinator
     if (this.ckpMetadata != null) {
       this.ckpMetadata.close();
     }
+    if (this.clientIds != null) {
+      this.clientIds.close();
+    }
   }
 
   @Override
   public void checkpointCoordinator(long checkpointId, CompletableFuture<byte[]> result) {
-    this.checkpointId = checkpointId;
     executor.execute(
         () -> {
           try {
@@ -239,29 +261,17 @@ public class StreamWriteOperatorCoordinator
           // the stream write task snapshot and flush the data buffer synchronously in sequence,
           // so a successful checkpoint subsumes the old one(follows the checkpoint subsuming contract)
           final boolean committed = commitInstant(this.instant, checkpointId);
-
-          if (tableState.scheduleCompaction) {
-            // if async compaction is on, schedule the compaction
-            CompactionUtil.scheduleCompaction(metaClient, writeClient, tableState.isDeltaTimeCompaction, committed);
-          }
+          // schedules the compaction or clustering if it is enabled in stream execution mode
+          scheduleTableServices(committed);
 
           if (committed) {
-            // start new instant.
-            startInstant();
             // sync Hive if is enabled
             syncHiveAsync();
+            // start new instant.
+            startInstant();
           }
         }, "commits the instant %s", this.instant
     );
-  }
-
-  @Override
-  public void notifyCheckpointAborted(long checkpointId) {
-    if (checkpointId == this.checkpointId) {
-      executor.execute(() -> {
-        this.ckpMetadata.abortInstant(this.instant);
-      }, "abort instant %s", this.instant);
-    }
   }
 
   @Override
@@ -277,7 +287,8 @@ public class StreamWriteOperatorCoordinator
 
     if (event.isEndInput()) {
       // handle end input event synchronously
-      handleEndInputEvent(event);
+      // wrap handleEndInputEvent in executeSync to preserve the order of events
+      executor.executeSync(() -> handleEndInputEvent(event), "handle end input event for instant %s", this.instant);
     } else {
       executor.execute(
           () -> {
@@ -293,9 +304,7 @@ public class StreamWriteOperatorCoordinator
 
   @Override
   public void subtaskFailed(int i, @Nullable Throwable throwable) {
-    // reset the event
-    this.eventBuffer[i] = null;
-    LOG.warn("Reset the event for task [" + i + "]", throwable);
+    // no operation
   }
 
   @Override
@@ -314,7 +323,7 @@ public class StreamWriteOperatorCoordinator
 
   private void initHiveSync() {
     this.hiveSyncExecutor = NonThrownExecutor.builder(LOG).waitForTasksFinish(true).build();
-    this.hiveSyncContext = HiveSyncContext.create(conf);
+    this.hiveSyncContext = HiveSyncContext.create(conf, this.storageConf);
   }
 
   private void syncHiveAsync() {
@@ -334,11 +343,24 @@ public class StreamWriteOperatorCoordinator
    * Sync hoodie table metadata to Hive metastore.
    */
   public void doSyncHive() {
-    hiveSyncContext.hiveSyncTool().syncHoodieTable();
+    try (HiveSyncTool syncTool = hiveSyncContext.hiveSyncTool()) {
+      syncTool.syncHoodieTable();
+    }
   }
 
-  private void initMetadataSync() {
-    this.writeClient.initMetadataWriter();
+  private static void initMetadataTable(HoodieFlinkWriteClient<?> writeClient) {
+    writeClient.initMetadataTable();
+  }
+
+  private static CkpMetadata initCkpMetadata(HoodieWriteConfig writeConfig, Configuration conf) throws IOException {
+    CkpMetadata ckpMetadata = CkpMetadataFactory.getCkpMetadata(writeConfig, conf);
+    ckpMetadata.bootstrap();
+    return ckpMetadata;
+  }
+
+  private void initClientIds(Configuration conf) {
+    this.clientIds = ClientIds.builder().conf(conf).build();
+    this.clientIds.start();
   }
 
   private void reset() {
@@ -350,11 +372,15 @@ public class StreamWriteOperatorCoordinator
    */
   private boolean allEventsReceived() {
     return Arrays.stream(eventBuffer)
-        .allMatch(event -> event != null && event.isReady(this.instant));
+        // we do not use event.isReady to check the instant
+        // because the write task may send an event eagerly for empty
+        // data set, the even may have a timestamp of last committed instant.
+        .allMatch(event -> event != null && event.isLastBatch());
   }
 
   private void addEventToBuffer(WriteMetadataEvent event) {
-    if (this.eventBuffer[event.getTaskID()] != null) {
+    if (this.eventBuffer[event.getTaskID()] != null
+        && this.eventBuffer[event.getTaskID()].getInstantTime().equals(event.getInstantTime())) {
       this.eventBuffer[event.getTaskID()].mergeWith(event);
     } else {
       this.eventBuffer[event.getTaskID()] = event;
@@ -362,10 +388,13 @@ public class StreamWriteOperatorCoordinator
   }
 
   private void startInstant() {
+    // refresh the last txn metadata
+    this.writeClient.preTxn(tableState.operationType, this.metaClient);
     // put the assignment in front of metadata generation,
     // because the instant request from write task is asynchronous.
     this.instant = this.writeClient.startCommit(tableState.commitAction, this.metaClient);
     this.metaClient.getActiveTimeline().transitionRequestedToInflight(tableState.commitAction, this.instant);
+    this.writeClient.setWriteTimer(tableState.commitAction);
     this.ckpMetadata.startInstant(this.instant);
     LOG.info("Create instant [{}] for table [{}] with type [{}]", this.instant,
         this.conf.getString(FlinkOptions.TABLE_NAME), conf.getString(FlinkOptions.TABLE_TYPE));
@@ -381,28 +410,49 @@ public class StreamWriteOperatorCoordinator
    * until it finds a new inflight instant on the timeline.
    */
   private void initInstant(String instant) {
-    HoodieTimeline completedTimeline =
-        StreamerUtil.createMetaClient(conf).getActiveTimeline().filterCompletedInstants();
-    executor.execute(() -> {
-      if (instant.equals("") || completedTimeline.containsInstant(instant)) {
-        // the last instant committed successfully
-        reset();
-      } else {
-        LOG.info("Recommit instant {}", instant);
-        commitInstant(instant);
+    HoodieTimeline completedTimeline = this.metaClient.getActiveTimeline().filterCompletedInstants();
+    if (instant.equals(WriteMetadataEvent.BOOTSTRAP_INSTANT) || completedTimeline.containsInstant(instant)) {
+      // the last instant committed successfully
+      reset();
+    } else {
+      LOG.info("Recommit instant {}", instant);
+      // Recommit should start heartbeat for lazy failed writes clean policy to avoid aborting for heartbeat expired.
+      if (writeClient.getConfig().getFailedWritesCleanPolicy().isLazy()) {
+        writeClient.getHeartbeatClient().start(instant);
       }
-      // starts a new instant
-      startInstant();
-      // upgrade downgrade
-      this.writeClient.upgradeDowngrade(this.instant);
-    }, "initialize instant %s", instant);
+      commitInstant(instant);
+    }
+    // stop the heartbeat for old instant
+    if (writeClient.getConfig().getFailedWritesCleanPolicy().isLazy() && !WriteMetadataEvent.BOOTSTRAP_INSTANT.equals(this.instant)) {
+      writeClient.getHeartbeatClient().stop(this.instant);
+    }
+    // starts a new instant
+    startInstant();
+    // upgrade downgrade
+    this.writeClient.upgradeDowngrade(this.instant, this.metaClient);
   }
 
   private void handleBootstrapEvent(WriteMetadataEvent event) {
     this.eventBuffer[event.getTaskID()] = event;
     if (Arrays.stream(eventBuffer).allMatch(evt -> evt != null && evt.isBootstrap())) {
       // start to initialize the instant.
-      initInstant(event.getInstantTime());
+      final String instant = Arrays.stream(eventBuffer)
+          .filter(evt -> evt.getWriteStatuses().size() > 0)
+          .findFirst().map(WriteMetadataEvent::getInstantTime)
+          .orElse(WriteMetadataEvent.BOOTSTRAP_INSTANT);
+
+      // if currentInstant is pending && bootstrap event instant is empty
+      // reuse currentInstant, reject bootstrap
+      if (this.metaClient.reloadActiveTimeline().filterInflightsAndRequested().containsInstant(this.instant)
+              && instant.equals(WriteMetadataEvent.BOOTSTRAP_INSTANT)
+              && this.tableState.operationType == WriteOperationType.INSERT) {
+        LOG.warn("Reuse current pending Instant {} with {} operationType, "
+                + "ignoring empty bootstrap event.", this.instant, WriteOperationType.INSERT.value());
+        reset();
+        return;
+      }
+
+      initInstant(instant);
     }
   }
 
@@ -410,12 +460,27 @@ public class StreamWriteOperatorCoordinator
     addEventToBuffer(event);
     if (allEventsReceived()) {
       // start to commit the instant.
-      commitInstant(this.instant);
-      // The executor thread inherits the classloader of the #handleEventFromOperator
-      // caller, which is a AppClassLoader.
-      Thread.currentThread().setContextClassLoader(getClass().getClassLoader());
-      // sync Hive synchronously if it is enabled in batch mode.
-      syncHive();
+      boolean committed = commitInstant(this.instant);
+      if (committed) {
+        // The executor thread inherits the classloader of the #handleEventFromOperator
+        // caller, which is a AppClassLoader.
+        Thread.currentThread().setContextClassLoader(getClass().getClassLoader());
+        // sync Hive synchronously if it is enabled in batch mode.
+        syncHive();
+        // schedules the compaction or clustering if it is enabled in batch execution mode
+        scheduleTableServices(true);
+      }
+    }
+  }
+
+  private void scheduleTableServices(Boolean committed) {
+    // if compaction is on, schedule the compaction
+    if (tableState.scheduleCompaction) {
+      CompactionUtil.scheduleCompaction(writeClient, tableState.isDeltaTimeCompaction, committed);
+    }
+    // if clustering is on, schedule the clustering
+    if (tableState.scheduleClustering) {
+      ClusteringUtil.scheduleClustering(conf, writeClient, committed);
     }
   }
 
@@ -424,7 +489,7 @@ public class StreamWriteOperatorCoordinator
     // if it checkpoints succeed then flushes the data buffer again before this coordinator receives a checkpoint
     // success event, the data buffer would flush with an older instant time.
     ValidationUtils.checkState(
-        HoodieTimeline.compareTimestamps(this.instant, HoodieTimeline.GREATER_THAN_OR_EQUALS, event.getInstantTime()),
+        compareTimestamps(this.instant, GREATER_THAN_OR_EQUALS, event.getInstantTime()),
         String.format("Receive an unexpected event for instant %s from task %d",
             event.getInstantTime(), event.getTaskID()));
 
@@ -459,8 +524,8 @@ public class StreamWriteOperatorCoordinator
   /**
    * Commits the instant.
    */
-  private void commitInstant(String instant) {
-    commitInstant(instant, -1);
+  private boolean commitInstant(String instant) {
+    return commitInstant(instant, -1);
   }
 
   /**
@@ -480,11 +545,15 @@ public class StreamWriteOperatorCoordinator
         .flatMap(Collection::stream)
         .collect(Collectors.toList());
 
-    if (writeResults.size() == 0) {
+    if (writeResults.size() == 0 && !OptionsResolver.allowCommitOnEmptyBatch(conf)) {
       // No data has written, reset the buffer and returns early
       reset();
       // Send commit ack event to the write function to unblock the flushing
-      sendCommitAckEvents(checkpointId);
+      // If this checkpoint has no inputs while the next checkpoint has inputs,
+      // the 'isConfirming' flag should be switched with the ack event.
+      if (checkpointId != -1) {
+        sendCommitAckEvents(checkpointId);
+      }
       return false;
     }
     doCommit(instant, writeResults);
@@ -522,12 +591,17 @@ public class StreamWriteOperatorCoordinator
       }
     } else {
       LOG.error("Error when writing. Errors/Total=" + totalErrorRecords + "/" + totalRecords);
-      LOG.error("The first 100 error messages");
-      writeResults.stream().filter(WriteStatus::hasErrors).limit(100).forEach(ws -> {
-        LOG.error("Global error for partition path {} and fileID {}: {}",
-            ws.getGlobalError(), ws.getPartitionPath(), ws.getFileId());
+      LOG.error("The first 10 files with write errors:");
+      writeResults.stream().filter(WriteStatus::hasErrors).limit(10).forEach(ws -> {
+        if (ws.getGlobalError() != null) {
+          LOG.error("Global error for partition path {} and fileID {}: {}",
+              ws.getPartitionPath(), ws.getFileId(), ws.getGlobalError());
+        }
         if (ws.getErrors().size() > 0) {
-          ws.getErrors().forEach((key, value) -> LOG.trace("Error for key:" + key + " and value " + value));
+          LOG.error("The first 100 records-level errors for partition path {} and fileID {}:",
+              ws.getPartitionPath(), ws.getFileId());
+          ws.getErrors().entrySet().stream().limit(100).forEach(entry -> LOG.error("Error for key: "
+              + entry.getKey() + " and Exception: " + entry.getValue().getMessage()));
         }
       });
       // Rolls back instant
@@ -549,6 +623,11 @@ public class StreamWriteOperatorCoordinator
   @VisibleForTesting
   public Context getContext() {
     return context;
+  }
+
+  @VisibleForTesting
+  public HoodieFlinkWriteClient getWriteClient() {
+    return writeClient;
   }
 
   @VisibleForTesting
@@ -596,6 +675,7 @@ public class StreamWriteOperatorCoordinator
     final String commitAction;
     final boolean isOverwrite;
     final boolean scheduleCompaction;
+    final boolean scheduleClustering;
     final boolean syncHive;
     final boolean syncMetadata;
     final boolean isDeltaTimeCompaction;
@@ -605,7 +685,8 @@ public class StreamWriteOperatorCoordinator
       this.commitAction = CommitUtils.getCommitActionType(this.operationType,
           HoodieTableType.valueOf(conf.getString(FlinkOptions.TABLE_TYPE).toUpperCase(Locale.ROOT)));
       this.isOverwrite = WriteOperationType.isOverwrite(this.operationType);
-      this.scheduleCompaction = StreamerUtil.needsScheduleCompaction(conf);
+      this.scheduleCompaction = OptionsResolver.needsScheduleCompaction(conf);
+      this.scheduleClustering = OptionsResolver.needsScheduleClustering(conf);
       this.syncHive = conf.getBoolean(FlinkOptions.HIVE_SYNC_ENABLED);
       this.syncMetadata = conf.getBoolean(FlinkOptions.METADATA_ENABLED);
       this.isDeltaTimeCompaction = OptionsResolver.isDeltaTimeCompaction(conf);

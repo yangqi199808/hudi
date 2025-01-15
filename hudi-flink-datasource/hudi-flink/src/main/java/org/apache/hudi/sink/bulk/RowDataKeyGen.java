@@ -18,10 +18,11 @@
 
 package org.apache.hudi.sink.bulk;
 
+import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.util.Option;
-import org.apache.hudi.common.util.PartitionPathEncodeUtils;
 import org.apache.hudi.common.util.StringUtils;
 import org.apache.hudi.configuration.FlinkOptions;
+import org.apache.hudi.configuration.OptionsResolver;
 import org.apache.hudi.exception.HoodieKeyException;
 import org.apache.hudi.keygen.TimestampBasedAvroKeyGenerator;
 import org.apache.hudi.util.RowDataProjection;
@@ -38,6 +39,9 @@ import java.io.Serializable;
 import java.util.Arrays;
 import java.util.List;
 
+import static org.apache.hudi.common.util.PartitionPathEncodeUtils.DEFAULT_PARTITION_PATH;
+import static org.apache.hudi.common.util.PartitionPathEncodeUtils.escapePathName;
+
 /**
  * Key generator for {@link RowData}.
  */
@@ -51,8 +55,8 @@ public class RowDataKeyGen implements Serializable {
   private static final String NULL_RECORDKEY_PLACEHOLDER = "__null__";
   private static final String EMPTY_RECORDKEY_PLACEHOLDER = "__empty__";
 
-  private static final String DEFAULT_PARTITION_PATH = "default";
   private static final String DEFAULT_PARTITION_PATH_SEPARATOR = "/";
+  private static final String DEFAULT_FIELD_SEPARATOR = ",";
 
   private final String[] recordKeyFields;
   private final String[] partitionPathFields;
@@ -62,6 +66,7 @@ public class RowDataKeyGen implements Serializable {
 
   private final boolean hiveStylePartitioning;
   private final boolean encodePartitionPath;
+  private final boolean consistentLogicalTimestampEnabled;
 
   private final Option<TimestampBasedAvroKeyGenerator> keyGenOpt;
 
@@ -74,29 +79,38 @@ public class RowDataKeyGen implements Serializable {
 
   private boolean nonPartitioned;
 
-  private RowDataKeyGen(
-      String recordKeys,
+  protected RowDataKeyGen(
+      Option<String> recordKeys,
       String partitionFields,
       RowType rowType,
       boolean hiveStylePartitioning,
       boolean encodePartitionPath,
+      boolean consistentLogicalTimestampEnabled,
       Option<TimestampBasedAvroKeyGenerator> keyGenOpt) {
-    this.recordKeyFields = recordKeys.split(",");
-    this.partitionPathFields = partitionFields.split(",");
+    this.partitionPathFields = partitionFields.split(DEFAULT_FIELD_SEPARATOR);
+    this.hiveStylePartitioning = hiveStylePartitioning;
+    this.encodePartitionPath = encodePartitionPath;
+    this.consistentLogicalTimestampEnabled = consistentLogicalTimestampEnabled;
+
     List<String> fieldNames = rowType.getFieldNames();
     List<LogicalType> fieldTypes = rowType.getChildren();
 
-    this.hiveStylePartitioning = hiveStylePartitioning;
-    this.encodePartitionPath = encodePartitionPath;
-    if (this.recordKeyFields.length == 1) {
-      // efficient code path
-      this.simpleRecordKey = true;
-      int recordKeyIdx = fieldNames.indexOf(this.recordKeyFields[0]);
-      this.recordKeyFieldGetter = RowData.createFieldGetter(fieldTypes.get(recordKeyIdx), recordKeyIdx);
+    if (!recordKeys.isPresent()) {
+      this.recordKeyFields = null;
       this.recordKeyProjection = null;
     } else {
-      this.recordKeyProjection = getProjection(this.recordKeyFields, fieldNames, fieldTypes);
+      this.recordKeyFields = recordKeys.get().split(DEFAULT_FIELD_SEPARATOR);
+      if (this.recordKeyFields.length == 1) {
+        // efficient code path
+        this.simpleRecordKey = true;
+        int recordKeyIdx = fieldNames.indexOf(this.recordKeyFields[0]);
+        this.recordKeyFieldGetter = RowData.createFieldGetter(fieldTypes.get(recordKeyIdx), recordKeyIdx);
+        this.recordKeyProjection = null;
+      } else {
+        this.recordKeyProjection = getProjection(this.recordKeyFields, fieldNames, fieldTypes);
+      }
     }
+
     if (this.partitionPathFields.length == 1) {
       // efficient code path
       if (this.partitionPathFields[0].equals("")) {
@@ -115,24 +129,29 @@ public class RowDataKeyGen implements Serializable {
 
   public static RowDataKeyGen instance(Configuration conf, RowType rowType) {
     Option<TimestampBasedAvroKeyGenerator> keyGeneratorOpt = Option.empty();
-    if (conf.getString(FlinkOptions.KEYGEN_CLASS_NAME).equals(TimestampBasedAvroKeyGenerator.class.getName())) {
+    if (TimestampBasedAvroKeyGenerator.class.getName().equals(conf.getString(FlinkOptions.KEYGEN_CLASS_NAME))) {
       try {
         keyGeneratorOpt = Option.of(new TimestampBasedAvroKeyGenerator(StreamerUtil.flinkConf2TypedProperties(conf)));
       } catch (IOException e) {
         throw new HoodieKeyException("Initialize TimestampBasedAvroKeyGenerator error", e);
       }
     }
-    return new RowDataKeyGen(conf.getString(FlinkOptions.RECORD_KEY_FIELD), conf.getString(FlinkOptions.PARTITION_PATH_FIELD),
+    boolean consistentLogicalTimestampEnabled = OptionsResolver.isConsistentLogicalTimestampEnabled(conf);
+    return new RowDataKeyGen(Option.of(conf.getString(FlinkOptions.RECORD_KEY_FIELD)), conf.getString(FlinkOptions.PARTITION_PATH_FIELD),
         rowType, conf.getBoolean(FlinkOptions.HIVE_STYLE_PARTITIONING), conf.getBoolean(FlinkOptions.URL_ENCODE_PARTITIONING),
-        keyGeneratorOpt);
+        consistentLogicalTimestampEnabled, keyGeneratorOpt);
+  }
+
+  public HoodieKey getHoodieKey(RowData rowData) {
+    return new HoodieKey(getRecordKey(rowData), getPartitionPath(rowData));
   }
 
   public String getRecordKey(RowData rowData) {
     if (this.simpleRecordKey) {
-      return getRecordKey(recordKeyFieldGetter.getFieldOrNull(rowData), this.recordKeyFields[0]);
+      return getRecordKey(recordKeyFieldGetter.getFieldOrNull(rowData), this.recordKeyFields[0], consistentLogicalTimestampEnabled);
     } else {
       Object[] keyValues = this.recordKeyProjection.projectAsValues(rowData);
-      return getRecordKey(keyValues, this.recordKeyFields);
+      return getRecordKey(keyValues, this.recordKeyFields, consistentLogicalTimestampEnabled);
     }
   }
 
@@ -148,28 +167,40 @@ public class RowDataKeyGen implements Serializable {
     }
   }
 
-  // reference: org.apache.hudi.keygen.KeyGenUtils.getRecordPartitionPath
-  private static String getRecordKey(Object[] keyValues, String[] keyFields) {
+  // reference: org.apache.hudi.keygen.KeyGenUtils.getRecordKey
+  private static String getRecordKey(Object[] keyValues, String[] keyFields, boolean consistentLogicalTimestampEnabled) {
     boolean keyIsNullEmpty = true;
     StringBuilder recordKey = new StringBuilder();
     for (int i = 0; i < keyValues.length; i++) {
       String recordKeyField = keyFields[i];
-      String recordKeyValue = StringUtils.objToString(keyValues[i]);
+      Object value = keyValues[i];
+      value = getTimestampValue(consistentLogicalTimestampEnabled, value);
+      String recordKeyValue = StringUtils.objToString(value);
       if (recordKeyValue == null) {
-        recordKey.append(recordKeyField).append(":").append(NULL_RECORDKEY_PLACEHOLDER).append(",");
+        recordKey.append(recordKeyField).append(":").append(NULL_RECORDKEY_PLACEHOLDER);
       } else if (recordKeyValue.isEmpty()) {
-        recordKey.append(recordKeyField).append(":").append(EMPTY_RECORDKEY_PLACEHOLDER).append(",");
+        recordKey.append(recordKeyField).append(":").append(EMPTY_RECORDKEY_PLACEHOLDER);
       } else {
-        recordKey.append(recordKeyField).append(":").append(recordKeyValue).append(",");
+        recordKey.append(recordKeyField).append(":").append(recordKeyValue);
         keyIsNullEmpty = false;
       }
+      if (i != keyValues.length - 1) {
+        recordKey.append(DEFAULT_FIELD_SEPARATOR);
+      }
     }
-    recordKey.deleteCharAt(recordKey.length() - 1);
     if (keyIsNullEmpty) {
-      throw new HoodieKeyException("recordKey values: \"" + recordKey + "\" for fields: "
-          + Arrays.toString(keyFields) + " cannot be entirely null or empty.");
+      throw new HoodieKeyException(String.format("recordKey values: \"%s\" for fields: %s cannot be entirely null or empty.",
+          recordKey, Arrays.toString(keyFields)));
     }
     return recordKey.toString();
+  }
+
+  private static Object getTimestampValue(boolean consistentLogicalTimestampEnabled, Object value) {
+    if (!consistentLogicalTimestampEnabled && (value instanceof TimestampData)) {
+      TimestampData timestampData = (TimestampData) value;
+      value = timestampData.toTimestamp().toInstant().toEpochMilli();
+    }
+    return value;
   }
 
   // reference: org.apache.hudi.keygen.KeyGenUtils.getRecordPartitionPath
@@ -183,25 +214,27 @@ public class RowDataKeyGen implements Serializable {
       String partField = partFields[i];
       String partValue = StringUtils.objToString(partValues[i]);
       if (partValue == null || partValue.isEmpty()) {
-        partitionPath.append(hiveStylePartitioning ? partField + "=" + DEFAULT_PARTITION_PATH
-            : DEFAULT_PARTITION_PATH);
+        partitionPath.append(hiveStylePartitioning ? partField + "=" + DEFAULT_PARTITION_PATH : DEFAULT_PARTITION_PATH);
       } else {
         if (encodePartitionPath) {
-          partValue = PartitionPathEncodeUtils.escapePathName(partValue);
+          partValue = escapePathName(partValue);
         }
         partitionPath.append(hiveStylePartitioning ? partField + "=" + partValue : partValue);
       }
-      partitionPath.append(DEFAULT_PARTITION_PATH_SEPARATOR);
+      if (i != partFields.length - 1) {
+        partitionPath.append(DEFAULT_PARTITION_PATH_SEPARATOR);
+      }
     }
-    partitionPath.deleteCharAt(partitionPath.length() - 1);
     return partitionPath.toString();
   }
 
   // reference: org.apache.hudi.keygen.KeyGenUtils.getRecordKey
-  public static String getRecordKey(Object recordKeyValue, String recordKeyField) {
+  public static String getRecordKey(Object recordKeyValue, String recordKeyField,boolean consistentLogicalTimestampEnabled) {
+    recordKeyValue = getTimestampValue(consistentLogicalTimestampEnabled, recordKeyValue);
     String recordKey = StringUtils.objToString(recordKeyValue);
     if (recordKey == null || recordKey.isEmpty()) {
-      throw new HoodieKeyException("recordKey value: \"" + recordKey + "\" for field: \"" + recordKeyField + "\" cannot be null or empty.");
+      throw new HoodieKeyException(String.format("recordKey value: \"%s\" for field: \"%s\" cannot be null or empty.",
+          recordKey, recordKeyField));
     }
     return recordKey;
   }
@@ -222,7 +255,7 @@ public class RowDataKeyGen implements Serializable {
       partitionPath = DEFAULT_PARTITION_PATH;
     }
     if (encodePartitionPath) {
-      partitionPath = PartitionPathEncodeUtils.escapePathName(partitionPath);
+      partitionPath = escapePathName(partitionPath);
     }
     if (hiveStylePartitioning) {
       partitionPath = partField + "=" + partitionPath;

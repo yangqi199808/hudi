@@ -21,7 +21,7 @@
     <parent>
         <artifactId>hudi</artifactId>
         <groupId>org.apache.hudi</groupId>
-        <version>0.11.0-SNAPSHOT</version>
+        <version>1.1.0-SNAPSHOT</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
     <modelVersion>4.0.0</modelVersion>
@@ -42,12 +42,6 @@
             <version>${project.version}</version>
         </dependency>
 
-        <!-- Logging -->
-        <dependency>
-            <groupId>log4j</groupId>
-            <artifactId>log4j</artifactId>
-        </dependency>
-
         <!-- Fasterxml -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
@@ -61,17 +55,15 @@
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
         </dependency>
-
-        <!-- Httpcomponents -->
         <dependency>
-            <groupId>org.apache.httpcomponents</groupId>
-            <artifactId>fluent-hc</artifactId>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
         </dependency>
 
         <dependency>
             <groupId>io.javalin</groupId>
             <artifactId>javalin</artifactId>
-            <version>2.8.0</version>
+            <version>${javalin.version}</version>
         </dependency>
 
         <dependency>
@@ -82,6 +74,13 @@
         <dependency>
             <groupId>org.rocksdb</groupId>
             <artifactId>rocksdbjni</artifactId>
+        </dependency>
+
+        <!-- Override the provided scope defined in hudi-common -->
+        <dependency>
+            <groupId>org.apache.avro</groupId>
+            <artifactId>avro</artifactId>
+            <scope>compile</scope>
         </dependency>
 
         <!-- Hadoop -->
@@ -155,22 +154,22 @@
                             <exclude>META-INF/*.DSA</exclude>
                             <exclude>META-INF/*.RSA</exclude>
                             <exclude>META-INF/services/javax.*</exclude>
+                            <exclude>**/*.proto</exclude>
+                            <exclude>hbase-webapps/**</exclude>
                         </excludes>
                     </filter>
                 </filters>
                 <artifactSet>
-                  <includes>
+                  <includes combine.children="append">
                       <!-- 
                          Include hudi-timeline-server with javalin dependencies. 
                          hadoop deps are to be provided at runtime. see run_server.sh 
                       -->
+                      <include>org.apache.hudi:hudi-hadoop-common</include>
                       <include>org.apache.hudi:hudi-common</include>
                       <include>org.apache.hudi:hudi-timeline-service</include>
-                      <include>org.apache.httpcomponents:httpclient</include>
-                      <include>org.apache.httpcomponents:httpcore</include>
                       <include>org.mortbay.jetty:jetty</include>
                       <include>org.mortbay.jetty:jetty-util</include>
-                      <include>org.apache.httpcomponents:fluent-hc</include>
                       <include>io.javalin:javalin</include>
                       <include>org.jetbrains.kotlin:kotlin-stdlib-jdk8</include>
                       <include>org.jetbrains.kotlin:kotlin-stdlib</include>
@@ -193,22 +192,34 @@
                       <include>org.eclipse.jetty.websocket:websocket-servlet</include>
                       <include>com.beust:jcommander</include>
                       <include>org.rocksdb:rocksdbjni</include>
-                      <include>org.codehaus.jackson:jackson-core-asl</include>
-                      <include>org.codehaus.jackson:jackson-mapper-asl</include>
                       <include>com.fasterxml.jackson.core:jackson-annotations</include>
                       <include>com.fasterxml.jackson.core:jackson-core</include>
                       <include>com.fasterxml.jackson.core:jackson-databind</include>
-                      <include>org.apache.htrace:htrace-core</include>
-                      <include>org.apache.hbase:hbase-common</include>
-                      <include>org.apache.hbase:hbase-client</include>
-                      <include>org.apache.hbase:hbase-protocol</include>
-                      <include>org.apache.hbase:hbase-server</include>
-                      <include>com.esotericsoftware:kryo-shaded</include>
-                      <include>com.esotericsoftware:minlog</include>
+                      <include>com.fasterxml.jackson.datatype:jackson-datatype-jsr310</include>
+                      <include>commons-io:commons-io</include>
                       <include>log4j:log4j</include>
-                      <include>org.objenesis:objenesis</include>
+                      <include>org.openjdk.jol:jol-core</include>
+                      <include>org.apache.avro:avro</include>
                   </includes>
                 </artifactSet>
+                <relocations combine.children="append">
+                    <relocation>
+                        <pattern>org.apache.commons.io.</pattern>
+                        <shadedPattern>org.apache.hudi.org.apache.commons.io.</shadedPattern>
+                    </relocation>
+                    <relocation>
+                        <pattern>org.openjdk.jol.</pattern>
+                        <shadedPattern>org.apache.hudi.org.openjdk.jol.</shadedPattern>
+                    </relocation>
+                    <relocation>
+                        <pattern>com.fasterxml.jackson.</pattern>
+                        <shadedPattern>org.apache.hudi.com.fasterxml.jackson.</shadedPattern>
+                    </relocation>
+                    <relocation>
+                        <pattern>org.apache.avro.</pattern>
+                        <shadedPattern>org.apache.hudi.org.apache.avro.</shadedPattern>
+                    </relocation>
+                </relocations>
             </configuration>
             <executions>
                 <execution>
@@ -234,6 +245,7 @@
     <properties>
         <checkstyle.skip>true</checkstyle.skip>
         <main.basedir>${project.parent.basedir}</main.basedir>
+        <skipTests>true</skipTests>
     </properties>
 
 

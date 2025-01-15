@@ -29,11 +29,12 @@ import org.apache.flink.table.types.logical.ArrayType;
 import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.MapType;
 import org.apache.flink.table.types.logical.RowType;
-
 import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.parquet.schema.GroupType;
+import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.OriginalType;
 import org.apache.parquet.schema.PrimitiveType;
@@ -45,6 +46,8 @@ import org.slf4j.LoggerFactory;
 import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.List;
+
+import static org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit;
 
 /**
  * Schema converter converts Parquet schema to and from Flink internal types.
@@ -73,7 +76,7 @@ public class ParquetSchemaConverter {
    * Converts Flink Internal Type to Parquet schema.
    *
    * @param typeInformation Flink type information
-   * @param legacyMode is standard LIST and MAP schema or back-compatible schema
+   * @param legacyMode      is standard LIST and MAP schema or back-compatible schema
    * @return Parquet schema
    */
   public static MessageType toParquetType(
@@ -436,7 +439,7 @@ public class ParquetSchemaConverter {
             String.format(
                 "Can not convert Flink MapTypeInfo %s to Parquet"
                     + " Map type as key has to be String",
-                typeInfo.toString()));
+                typeInfo));
       }
     } else if (typeInfo instanceof ObjectArrayTypeInfo) {
       ObjectArrayTypeInfo objectArrayTypeInfo = (ObjectArrayTypeInfo) typeInfo;
@@ -537,13 +540,11 @@ public class ParquetSchemaConverter {
   public static MessageType convertToParquetMessageType(String name, RowType rowType) {
     Type[] types = new Type[rowType.getFieldCount()];
     for (int i = 0; i < rowType.getFieldCount(); i++) {
-      types[i] = convertToParquetType(rowType.getFieldNames().get(i), rowType.getTypeAt(i));
+      String fieldName = rowType.getFieldNames().get(i);
+      LogicalType fieldType = rowType.getTypeAt(i);
+      types[i] = convertToParquetType(fieldName, fieldType, fieldType.isNullable() ? Type.Repetition.OPTIONAL : Type.Repetition.REQUIRED);
     }
     return new MessageType(name, types);
-  }
-
-  private static Type convertToParquetType(String name, LogicalType type) {
-    return convertToParquetType(name, type, Type.Repetition.OPTIONAL);
   }
 
   private static Type convertToParquetType(
@@ -566,19 +567,17 @@ public class ParquetSchemaConverter {
         int scale = ((DecimalType) type).getScale();
         int numBytes = computeMinBytesForDecimalPrecision(precision);
         return Types.primitive(
-            PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY, repetition)
-            .precision(precision)
-            .scale(scale)
+                PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY, repetition)
+            .as(LogicalTypeAnnotation.decimalType(scale, precision))
             .length(numBytes)
-            .as(OriginalType.DECIMAL)
             .named(name);
       case TINYINT:
         return Types.primitive(PrimitiveType.PrimitiveTypeName.INT32, repetition)
-            .as(OriginalType.INT_8)
+            .as(LogicalTypeAnnotation.intType(8, true))
             .named(name);
       case SMALLINT:
         return Types.primitive(PrimitiveType.PrimitiveTypeName.INT32, repetition)
-            .as(OriginalType.INT_16)
+            .as(LogicalTypeAnnotation.intType(16, true))
             .named(name);
       case INTEGER:
         return Types.primitive(PrimitiveType.PrimitiveTypeName.INT32, repetition)
@@ -594,16 +593,18 @@ public class ParquetSchemaConverter {
             .named(name);
       case DATE:
         return Types.primitive(PrimitiveType.PrimitiveTypeName.INT32, repetition)
-            .as(OriginalType.DATE)
+            .as(LogicalTypeAnnotation.dateType())
             .named(name);
       case TIME_WITHOUT_TIME_ZONE:
         return Types.primitive(PrimitiveType.PrimitiveTypeName.INT32, repetition)
-            .as(OriginalType.TIME_MILLIS)
+            .as(LogicalTypeAnnotation.timeType(true, TimeUnit.MILLIS))
             .named(name);
       case TIMESTAMP_WITHOUT_TIME_ZONE:
         TimestampType timestampType = (TimestampType) type;
-        if (timestampType.getPrecision() == 3) {
+        if (timestampType.getPrecision() == 3 || timestampType.getPrecision() == 6) {
+          TimeUnit timeunit = timestampType.getPrecision() == 3 ? TimeUnit.MILLIS : TimeUnit.MICROS;
           return Types.primitive(PrimitiveType.PrimitiveTypeName.INT64, repetition)
+              .as(LogicalTypeAnnotation.timestampType(true, timeunit))
               .named(name);
         } else {
           return Types.primitive(PrimitiveType.PrimitiveTypeName.INT96, repetition)
@@ -611,8 +612,10 @@ public class ParquetSchemaConverter {
         }
       case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
         LocalZonedTimestampType localZonedTimestampType = (LocalZonedTimestampType) type;
-        if (localZonedTimestampType.getPrecision() == 3) {
+        if (localZonedTimestampType.getPrecision() == 3 || localZonedTimestampType.getPrecision() == 6) {
+          TimeUnit timeunit = localZonedTimestampType.getPrecision() == 3 ? TimeUnit.MILLIS : TimeUnit.MICROS;
           return Types.primitive(PrimitiveType.PrimitiveTypeName.INT64, repetition)
+              .as(LogicalTypeAnnotation.timestampType(false, timeunit))
               .named(name);
         } else {
           return Types.primitive(PrimitiveType.PrimitiveTypeName.INT96, repetition)
@@ -620,18 +623,25 @@ public class ParquetSchemaConverter {
         }
       case ARRAY:
         // <list-repetition> group <name> (LIST) {
-        //   repeated group list {
+        //   repeated group array {
         //     <element-repetition> <element-type> element;
         //   }
         // }
         ArrayType arrayType = (ArrayType) type;
         LogicalType elementType = arrayType.getElementType();
+
+        Types.GroupBuilder<GroupType> arrayGroupBuilder = Types.repeatedGroup();
+        if (elementType.getTypeRoot() == LogicalTypeRoot.ROW) {
+          RowType rowType = (RowType) elementType;
+          rowType.getFields().forEach(field ->
+                  arrayGroupBuilder.addField(convertToParquetType(field.getName(), field.getType(), repetition)));
+        } else {
+          arrayGroupBuilder.addField(convertToParquetType("element", elementType, repetition));
+        }
+
         return Types
             .buildGroup(repetition).as(OriginalType.LIST)
-            .addField(
-                Types.repeatedGroup()
-                    .addField(convertToParquetType("element", elementType, repetition))
-                    .named("list"))
+            .addField(arrayGroupBuilder.named("array"))
             .named(name);
       case MAP:
         // <map-repetition> group <name> (MAP) {
@@ -648,7 +658,7 @@ public class ParquetSchemaConverter {
             .addField(
                 Types
                     .repeatedGroup()
-                    .addField(convertToParquetType("key", keyType, repetition))
+                    .addField(convertToParquetType("key", keyType, Type.Repetition.REQUIRED))
                     .addField(convertToParquetType("value", valueType, repetition))
                     .named("key_value"))
             .named(name);

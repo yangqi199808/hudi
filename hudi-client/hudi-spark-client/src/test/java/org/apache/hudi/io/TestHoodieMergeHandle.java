@@ -21,23 +21,23 @@ package org.apache.hudi.io;
 import org.apache.hudi.client.SparkRDDWriteClient;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.common.config.HoodieCommonConfig;
-import org.apache.hudi.common.fs.FSUtils;
+import org.apache.hudi.common.config.HoodieStorageConfig;
+import org.apache.hudi.common.model.BaseFile;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieWriteStat;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
-import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
+import org.apache.hudi.common.table.view.HoodieTableFileSystemView;
 import org.apache.hudi.common.testutils.HoodieTestDataGenerator;
+import org.apache.hudi.common.testutils.HoodieTestTable;
 import org.apache.hudi.common.util.collection.ExternalSpillableMap;
 import org.apache.hudi.config.HoodieCompactionConfig;
 import org.apache.hudi.config.HoodieIndexConfig;
-import org.apache.hudi.config.HoodieStorageConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.index.HoodieIndex;
-import org.apache.hudi.testutils.HoodieClientTestHarness;
 import org.apache.hudi.testutils.HoodieClientTestUtils;
+import org.apache.hudi.testutils.HoodieSparkClientTestHarness;
 
-import org.apache.hadoop.fs.FileSystem;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
@@ -51,8 +51,12 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.apache.hudi.common.testutils.HoodieTestUtils.INSTANT_GENERATOR;
+import static org.apache.hudi.common.testutils.HoodieTestUtils.TIMELINE_FACTORY;
 import static org.apache.hudi.testutils.Assertions.assertNoWriteErrors;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -60,13 +64,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
 
 @SuppressWarnings("unchecked")
-public class TestHoodieMergeHandle extends HoodieClientTestHarness {
+public class TestHoodieMergeHandle extends HoodieSparkClientTestHarness {
 
   @BeforeEach
   public void setUp() throws Exception {
     initSparkContexts();
     initPath();
-    initFileSystem();
+    initHoodieStorage();
     initTestDataGenerator();
     initMetaClient();
   }
@@ -94,7 +98,6 @@ public class TestHoodieMergeHandle extends HoodieClientTestHarness {
         .withProperties(properties)
         .build();
     try (SparkRDDWriteClient client = getHoodieWriteClient(cfg);) {
-      FileSystem fs = FSUtils.getFs(basePath, hadoopConf);
 
       /**
        * Write 1 (only inserts) This will do a bulk insert of 44 records of which there are 2 records repeated 21 times
@@ -119,12 +122,12 @@ public class TestHoodieMergeHandle extends HoodieClientTestHarness {
 
       // verify that there is a commit
       metaClient = HoodieTableMetaClient.reload(metaClient);
-      HoodieTimeline timeline = new HoodieActiveTimeline(metaClient).getCommitTimeline();
+      HoodieTimeline timeline = TIMELINE_FACTORY.createActiveTimeline(metaClient).getCommitAndReplaceTimeline();
       assertEquals(1, timeline.findInstantsAfter("000", Integer.MAX_VALUE).countInstants(),
           "Expecting a single commit.");
-      assertEquals(newCommitTime, timeline.lastInstant().get().getTimestamp(), "Latest commit should be 001");
+      assertEquals(newCommitTime, timeline.lastInstant().get().requestedTime(), "Latest commit should be 001");
       assertEquals(records.size(),
-          HoodieClientTestUtils.readCommit(basePath, sqlContext, timeline, newCommitTime).count(),
+          HoodieClientTestUtils.readCommit(basePath, sqlContext, timeline, newCommitTime, true, INSTANT_GENERATOR).count(),
           "Must contain 44 records");
 
       /**
@@ -145,9 +148,9 @@ public class TestHoodieMergeHandle extends HoodieClientTestHarness {
 
       // verify that there are 2 commits
       metaClient = HoodieTableMetaClient.reload(metaClient);
-      timeline = new HoodieActiveTimeline(metaClient).getCommitTimeline();
+      timeline = TIMELINE_FACTORY.createActiveTimeline(metaClient).getCommitAndReplaceTimeline();
       assertEquals(2, timeline.findInstantsAfter("000", Integer.MAX_VALUE).countInstants(), "Expecting two commits.");
-      assertEquals(newCommitTime, timeline.lastInstant().get().getTimestamp(), "Latest commit should be 002");
+      assertEquals(newCommitTime, timeline.lastInstant().get().requestedTime(), "Latest commit should be 002");
       Dataset<Row> dataSet = getRecords();
       assertEquals(45, dataSet.count(), "Must contain 45 records");
 
@@ -165,9 +168,9 @@ public class TestHoodieMergeHandle extends HoodieClientTestHarness {
 
       // verify that there are now 3 commits
       metaClient = HoodieTableMetaClient.reload(metaClient);
-      timeline = new HoodieActiveTimeline(metaClient).getCommitTimeline();
+      timeline = TIMELINE_FACTORY.createActiveTimeline(metaClient).getCommitAndReplaceTimeline();
       assertEquals(3, timeline.findInstantsAfter("000", Integer.MAX_VALUE).countInstants(), "Expecting three commits.");
-      assertEquals(newCommitTime, timeline.lastInstant().get().getTimestamp(), "Latest commit should be 003");
+      assertEquals(newCommitTime, timeline.lastInstant().get().requestedTime(), "Latest commit should be 003");
       dataSet = getRecords();
       assertEquals(47, dataSet.count(), "Must contain 47 records");
 
@@ -195,13 +198,14 @@ public class TestHoodieMergeHandle extends HoodieClientTestHarness {
       assertNoWriteErrors(statuses);
 
       // verify there are now 4 commits
-      timeline = new HoodieActiveTimeline(metaClient).getCommitTimeline();
+      timeline = TIMELINE_FACTORY.createActiveTimeline(metaClient).getCommitAndReplaceTimeline();
       assertEquals(4, timeline.findInstantsAfter("000", Integer.MAX_VALUE).countInstants(), "Expecting four commits.");
-      assertEquals(timeline.lastInstant().get().getTimestamp(), newCommitTime, "Latest commit should be 004");
+      assertEquals(timeline.lastInstant().get().requestedTime(), newCommitTime, "Latest commit should be 004");
 
       // Check the entire dataset has 47 records still
       dataSet = getRecords();
       assertEquals(47, dataSet.count(), "Must contain 47 records");
+
       Row[] rows = (Row[]) dataSet.collect();
       int record1Count = 0;
       int record2Count = 0;
@@ -228,6 +232,22 @@ public class TestHoodieMergeHandle extends HoodieClientTestHarness {
       // Assert that id2 record count which has been updated to rider-004 and driver-004 is 21, which is the total
       // number of records with row_key id2
       assertEquals(21, record2Count);
+
+      // Validate that all the records only reference the _latest_ base files as part of the
+      // FILENAME_METADATA_FIELD payload (entailing that corresponding metadata is in-sync with
+      // the state of the table
+      HoodieTableFileSystemView tableView =
+          getHoodieTableFileSystemView(metaClient, metaClient.getActiveTimeline(), HoodieTestTable.of(metaClient).listAllBaseFiles());
+
+      Set<String> latestBaseFileNames = tableView.getLatestBaseFiles()
+          .map(BaseFile::getFileName)
+          .collect(Collectors.toSet());
+
+      Set<Object> metadataFilenameFieldRefs = dataSet.collectAsList().stream()
+          .map(row -> row.getAs(HoodieRecord.FILENAME_METADATA_FIELD))
+          .collect(Collectors.toSet());
+
+      assertEquals(latestBaseFileNames, metadataFilenameFieldRefs);
     }
   }
 
@@ -313,7 +333,7 @@ public class TestHoodieMergeHandle extends HoodieClientTestHarness {
           (long) statuses.stream().map(status -> status.getStat().getNumInserts()).reduce((a, b) -> a + b).get());
       // Verify all records have location set
       statuses.forEach(writeStatus -> {
-        writeStatus.getWrittenRecords().forEach(r -> {
+        writeStatus.getWrittenRecordDelegates().forEach(r -> {
           // Ensure New Location is set
           assertTrue(r.getNewLocation().isPresent());
         });
@@ -327,11 +347,12 @@ public class TestHoodieMergeHandle extends HoodieClientTestHarness {
     for (int i = 0; i < fullPartitionPaths.length; i++) {
       fullPartitionPaths[i] = Paths.get(basePath, dataGen.getPartitionPaths()[i], "*").toString();
     }
-    Dataset<Row> dataSet = HoodieClientTestUtils.read(jsc, basePath, sqlContext, fs, fullPartitionPaths);
+    Dataset<Row> dataSet =
+        HoodieClientTestUtils.read(jsc, basePath, sqlContext, storage, fullPartitionPaths);
     return dataSet;
   }
 
-  HoodieWriteConfig.Builder getConfigBuilder() {
+  protected HoodieWriteConfig.Builder getConfigBuilder() {
     return HoodieWriteConfig.newBuilder().withPath(basePath).withSchema(HoodieTestDataGenerator.TRIP_EXAMPLE_SCHEMA)
         .withParallelism(2, 2)
         .withDeleteParallelism(2)

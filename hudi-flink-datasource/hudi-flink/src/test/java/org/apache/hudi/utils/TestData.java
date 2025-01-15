@@ -21,18 +21,34 @@ package org.apache.hudi.utils;
 import org.apache.hudi.client.common.HoodieFlinkEngineContext;
 import org.apache.hudi.common.config.HoodieCommonConfig;
 import org.apache.hudi.common.fs.FSUtils;
+import org.apache.hudi.common.model.BaseFile;
+import org.apache.hudi.common.model.FileSlice;
+import org.apache.hudi.common.model.HoodieAvroRecord;
+import org.apache.hudi.common.model.HoodieLogFile;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.TableSchemaResolver;
 import org.apache.hudi.common.table.log.HoodieMergedLogRecordScanner;
-import org.apache.hudi.common.testutils.HoodieTestUtils;
+import org.apache.hudi.common.table.timeline.HoodieInstant;
+import org.apache.hudi.common.util.Option;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.configuration.FlinkOptions;
+import org.apache.hudi.configuration.OptionsResolver;
+import org.apache.hudi.sink.utils.BucketStreamWriteFunctionWrapper;
+import org.apache.hudi.sink.utils.BulkInsertFunctionWrapper;
+import org.apache.hudi.sink.utils.ConsistentBucketStreamWriteFunctionWrapper;
+import org.apache.hudi.sink.utils.InsertFunctionWrapper;
 import org.apache.hudi.sink.utils.StreamWriteFunctionWrapper;
+import org.apache.hudi.sink.utils.TestFunctionWrapper;
+import org.apache.hudi.storage.HoodieStorage;
 import org.apache.hudi.table.HoodieFlinkTable;
 
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.generic.GenericRecordBuilder;
+import org.apache.avro.generic.IndexedRecord;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
+import org.apache.flink.table.data.DecimalData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.data.TimestampData;
@@ -46,27 +62,35 @@ import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.types.Row;
 import org.apache.flink.types.RowKind;
-import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.parquet.Strings;
 import org.apache.parquet.avro.AvroParquetReader;
 import org.apache.parquet.hadoop.ParquetReader;
 
 import java.io.File;
 import java.io.FileFilter;
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
-import java.util.Properties;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import static junit.framework.TestCase.assertEquals;
+import static org.apache.hudi.common.table.HoodieTableConfig.HOODIE_PROPERTIES_FILE;
+import static org.apache.hudi.common.table.HoodieTableMetaClient.METAFOLDER_NAME;
+import static org.apache.hudi.common.testutils.HoodieTestUtils.createMetaClient;
+import static org.apache.hudi.hadoop.utils.HoodieInputFormatUtils.HOODIE_RECORD_KEY_COL_POS;
+import static org.apache.hudi.table.format.FormatUtils.buildAvroRecordBySchema;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -93,6 +117,11 @@ public class TestData {
           TimestampData.fromEpochMillis(7), StringData.fromString("par4")),
       insertRow(StringData.fromString("id8"), StringData.fromString("Han"), 56,
           TimestampData.fromEpochMillis(8), StringData.fromString("par4"))
+  );
+
+  public static List<RowData> DATA_SET_INSERT_PARTITION_IS_NULL = Arrays.asList(
+      insertRow(StringData.fromString("idNull"), StringData.fromString("He"), 30,
+          TimestampData.fromEpochMillis(9), null)
   );
 
   public static List<RowData> DATA_SET_UPDATE_INSERT = Arrays.asList(
@@ -164,6 +193,18 @@ public class TestData {
           TimestampData.fromEpochMillis(8000), StringData.fromString("par4"))
   );
 
+  // data set of test_source.data first commit.
+  public static List<RowData> DATA_SET_SOURCE_INSERT_FIRST_COMMIT = Arrays.asList(
+      insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 23,
+          TimestampData.fromEpochMillis(1000), StringData.fromString("par1")),
+      insertRow(StringData.fromString("id2"), StringData.fromString("Stephen"), 33,
+          TimestampData.fromEpochMillis(2000), StringData.fromString("par1")),
+      insertRow(StringData.fromString("id3"), StringData.fromString("Julian"), 53,
+          TimestampData.fromEpochMillis(3000), StringData.fromString("par2")),
+      insertRow(StringData.fromString("id4"), StringData.fromString("Fabian"), 31,
+          TimestampData.fromEpochMillis(4000), StringData.fromString("par2"))
+  );
+
   // data set of test_source.data latest commit.
   public static List<RowData> DATA_SET_SOURCE_INSERT_LATEST_COMMIT = Arrays.asList(
       insertRow(StringData.fromString("id5"), StringData.fromString("Sophia"), 18,
@@ -202,6 +243,36 @@ public class TestData {
           TimestampData.fromEpochMillis(8000), StringData.fromString("par4"))
   );
 
+  // changelog details of test_source.data and test_source_2.data
+  public static List<RowData> DATA_SET_SOURCE_CHANGELOG = Arrays.asList(
+      updateBeforeRow(StringData.fromString("id1"), StringData.fromString("Danny"), 23,
+          TimestampData.fromEpochMillis(1000), StringData.fromString("par1")),
+      updateAfterRow(StringData.fromString("id1"), StringData.fromString("Danny"), 24,
+          TimestampData.fromEpochMillis(1000), StringData.fromString("par1")),
+      updateBeforeRow(StringData.fromString("id2"), StringData.fromString("Stephen"), 33,
+          TimestampData.fromEpochMillis(2000), StringData.fromString("par1")),
+      updateAfterRow(StringData.fromString("id2"), StringData.fromString("Stephen"), 34,
+          TimestampData.fromEpochMillis(2000), StringData.fromString("par1")),
+      updateBeforeRow(StringData.fromString("id3"), StringData.fromString("Julian"), 53,
+          TimestampData.fromEpochMillis(3000), StringData.fromString("par2")),
+      updateAfterRow(StringData.fromString("id3"), StringData.fromString("Julian"), 54,
+          TimestampData.fromEpochMillis(3000), StringData.fromString("par2")),
+      updateBeforeRow(StringData.fromString("id4"), StringData.fromString("Fabian"), 31,
+          TimestampData.fromEpochMillis(4000), StringData.fromString("par2")),
+      updateAfterRow(StringData.fromString("id4"), StringData.fromString("Fabian"), 32,
+          TimestampData.fromEpochMillis(4000), StringData.fromString("par2")),
+      updateBeforeRow(StringData.fromString("id5"), StringData.fromString("Sophia"), 18,
+          TimestampData.fromEpochMillis(5000), StringData.fromString("par3")),
+      updateAfterRow(StringData.fromString("id5"), StringData.fromString("Sophia"), 18,
+          TimestampData.fromEpochMillis(5000), StringData.fromString("par3")),
+      insertRow(StringData.fromString("id9"), StringData.fromString("Jane"), 19,
+          TimestampData.fromEpochMillis(6000), StringData.fromString("par3")),
+      insertRow(StringData.fromString("id10"), StringData.fromString("Ella"), 38,
+          TimestampData.fromEpochMillis(7000), StringData.fromString("par4")),
+      insertRow(StringData.fromString("id11"), StringData.fromString("Phoebe"), 52,
+          TimestampData.fromEpochMillis(8000), StringData.fromString("par4"))
+  );
+
   // data set of test_source.data with partition 'par1' overwrite
   public static List<RowData> DATA_SET_SOURCE_INSERT_OVERWRITE = Arrays.asList(
       insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 24,
@@ -212,6 +283,22 @@ public class TestData {
           TimestampData.fromEpochMillis(3000), StringData.fromString("par2")),
       insertRow(StringData.fromString("id4"), StringData.fromString("Fabian"), 31,
           TimestampData.fromEpochMillis(4000), StringData.fromString("par2")),
+      insertRow(StringData.fromString("id5"), StringData.fromString("Sophia"), 18,
+          TimestampData.fromEpochMillis(5000), StringData.fromString("par3")),
+      insertRow(StringData.fromString("id6"), StringData.fromString("Emma"), 20,
+          TimestampData.fromEpochMillis(6000), StringData.fromString("par3")),
+      insertRow(StringData.fromString("id7"), StringData.fromString("Bob"), 44,
+          TimestampData.fromEpochMillis(7000), StringData.fromString("par4")),
+      insertRow(StringData.fromString("id8"), StringData.fromString("Han"), 56,
+          TimestampData.fromEpochMillis(8000), StringData.fromString("par4"))
+  );
+
+  // data set of test_source.data with partition 'par1' and 'par2' overwrite
+  public static List<RowData> DATA_SET_SOURCE_INSERT_OVERWRITE_DYNAMIC_PARTITION = Arrays.asList(
+      insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 24,
+          TimestampData.fromEpochMillis(1000), StringData.fromString("par1")),
+      insertRow(StringData.fromString("id2"), StringData.fromString("Stephen"), 34,
+          TimestampData.fromEpochMillis(2000), StringData.fromString("par2")),
       insertRow(StringData.fromString("id5"), StringData.fromString("Sophia"), 18,
           TimestampData.fromEpochMillis(5000), StringData.fromString("par3")),
       insertRow(StringData.fromString("id6"), StringData.fromString("Emma"), 20,
@@ -264,6 +351,40 @@ public class TestData {
       insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 23,
           TimestampData.fromEpochMillis(1), StringData.fromString("par1")));
 
+  public static List<RowData> DATA_SET_PART1 = Collections.singletonList(
+      insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 23,
+          TimestampData.fromEpochMillis(1), StringData.fromString("par1")));
+
+  public static List<RowData> DATA_SET_PART2 = Collections.singletonList(
+      insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 23,
+          TimestampData.fromEpochMillis(1), StringData.fromString("par2")));
+
+  public static List<RowData> DATA_SET_SINGLE_DELETE = Collections.singletonList(
+      deleteRow(StringData.fromString("id1"), StringData.fromString("Danny"), 23,
+          TimestampData.fromEpochMillis(5), StringData.fromString("par1")));
+
+  public static List<RowData> DATA_SET_DISORDER_INSERT = Arrays.asList(
+      insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 23,
+          TimestampData.fromEpochMillis(3), StringData.fromString("par1")),
+      insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 22,
+          TimestampData.fromEpochMillis(4), StringData.fromString("par1")),
+      insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 23,
+          TimestampData.fromEpochMillis(2), StringData.fromString("par1")),
+      insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 23,
+          TimestampData.fromEpochMillis(1), StringData.fromString("par1"))
+  );
+
+  public static List<RowData> DATA_SET_DISORDER_INSERT_DELETE = Arrays.asList(
+      insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 23,
+          TimestampData.fromEpochMillis(3), StringData.fromString("par1")),
+      insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 22,
+          TimestampData.fromEpochMillis(4), StringData.fromString("par1")),
+      insertRow(StringData.fromString("id1"), StringData.fromString("Danny"), 23,
+          TimestampData.fromEpochMillis(2), StringData.fromString("par1")),
+      deleteRow(StringData.fromString("id1"), StringData.fromString("Danny"), 23,
+          TimestampData.fromEpochMillis(1), StringData.fromString("par1"))
+  );
+
   public static List<RowData> DATA_SET_DISORDER_UPDATE_DELETE = Arrays.asList(
       // DISORDER UPDATE
       updateAfterRow(StringData.fromString("id1"), StringData.fromString("Danny"), 21,
@@ -283,12 +404,84 @@ public class TestData {
           TimestampData.fromEpochMillis(2), StringData.fromString("par1"))
   );
 
+  // data types handled specifically for Hoodie Key
+  public static List<RowData> DATA_SET_INSERT_HOODIE_KEY_SPECIAL_DATA_TYPE = new ArrayList<>();
+
+  static {
+    IntStream.range(1, 9).forEach(i -> DATA_SET_INSERT_HOODIE_KEY_SPECIAL_DATA_TYPE.add(
+        insertRow(TestConfigurations.ROW_TYPE_HOODIE_KEY_SPECIAL_DATA_TYPE,
+            TimestampData.fromEpochMillis(i), i, DecimalData.fromBigDecimal(new BigDecimal(String.format("%d.%d%d", i, i, i)), 3, 2))));
+  }
+
   public static List<RowData> dataSetInsert(int... ids) {
     List<RowData> inserts = new ArrayList<>();
     Arrays.stream(ids).forEach(i -> inserts.add(
         insertRow(StringData.fromString("id" + i), StringData.fromString("Danny"), 23,
             TimestampData.fromEpochMillis(i), StringData.fromString("par1"))));
     return inserts;
+  }
+
+  public static List<RowData> dataSetUpsert(int... ids) {
+    List<RowData> inserts = new ArrayList<>();
+    Arrays.stream(ids).forEach(i -> {
+      inserts.add(
+          updateBeforeRow(StringData.fromString("id" + i), StringData.fromString("Danny"), 23,
+              TimestampData.fromEpochMillis(i), StringData.fromString("par1")));
+      inserts.add(
+          updateAfterRow(StringData.fromString("id" + i), StringData.fromString("Danny"), 23,
+              TimestampData.fromEpochMillis(i), StringData.fromString("par1")));
+    });
+    return inserts;
+  }
+
+  /**
+   * Updates the rows with given value {@code val} at field index {@code idx}.
+   * All the target rows specified with range {@code targets} would be updated.
+   *
+   * <p>NOTE: only INT type is supported.
+   *
+   * @param dataset The rows to update
+   * @param idx     The target field index
+   * @param val     The new value
+   * @param targets The target row numbers to update, the number starts from 0
+   *
+   * @return Copied rows with new values setup.
+   */
+  public static List<RowData> update(List<RowData> dataset, int idx, int val, int... targets) {
+    List<RowData> copied = dataset.stream().map(TestConfigurations.SERIALIZER::copy).collect(Collectors.toList());
+    Arrays.stream(targets).forEach(target -> {
+      BinaryRowData rowData = (BinaryRowData) copied.get(target);
+      rowData.setInt(idx, val);
+    });
+    return copied;
+  }
+
+  /**
+   * Returns a copy of the given rows excluding the rows at indices {@code targets}.
+   */
+  public static List<RowData> delete(List<RowData> dataset, int... targets) {
+    Set<Integer> exclude = Arrays.stream(targets).boxed().collect(Collectors.toSet());
+    return IntStream.range(0, dataset.size())
+        .filter(i -> !exclude.contains(i))
+        .mapToObj(i -> TestConfigurations.SERIALIZER.copy(dataset.get(i))).collect(Collectors.toList());
+  }
+
+  public static List<RowData> filterOddRows(List<RowData> rows) {
+    return filterRowsByIndexPredicate(rows, i -> i % 2 != 0);
+  }
+
+  public static List<RowData> filterEvenRows(List<RowData> rows) {
+    return filterRowsByIndexPredicate(rows, i -> i % 2 == 0);
+  }
+
+  private static List<RowData> filterRowsByIndexPredicate(List<RowData> rows, Predicate<Integer> predicate) {
+    List<RowData> filtered = new ArrayList<>();
+    for (int i = 0; i < rows.size(); i++) {
+      if (predicate.test(i)) {
+        filtered.add(rows.get(i));
+      }
+    }
+    return filtered;
   }
 
   private static Integer toIdSafely(Object id) {
@@ -324,9 +517,7 @@ public class TestData {
   public static void writeData(
       List<RowData> dataBuffer,
       Configuration conf) throws Exception {
-    StreamWriteFunctionWrapper<RowData> funcWrapper = new StreamWriteFunctionWrapper<>(
-        conf.getString(FlinkOptions.PATH),
-        conf);
+    final TestFunctionWrapper<RowData> funcWrapper = getWritePipeline(conf.getString(FlinkOptions.PATH), conf);
     funcWrapper.openFunction();
 
     for (RowData rowData : dataBuffer) {
@@ -356,9 +547,7 @@ public class TestData {
   public static void writeDataAsBatch(
       List<RowData> dataBuffer,
       Configuration conf) throws Exception {
-    StreamWriteFunctionWrapper<RowData> funcWrapper = new StreamWriteFunctionWrapper<>(
-        conf.getString(FlinkOptions.PATH),
-        conf);
+    TestFunctionWrapper<RowData> funcWrapper = getWritePipeline(conf.getString(FlinkOptions.PATH), conf);
     funcWrapper.openFunction();
 
     for (RowData rowData : dataBuffer) {
@@ -371,7 +560,28 @@ public class TestData {
     final OperatorEvent nextEvent = funcWrapper.getNextEvent();
     funcWrapper.getCoordinator().handleEventFromOperator(0, nextEvent);
 
+    funcWrapper.inlineCompaction();
+
     funcWrapper.close();
+  }
+
+  /**
+   * Initializes a writing pipeline with given configuration.
+   */
+  public static TestFunctionWrapper<RowData> getWritePipeline(String basePath, Configuration conf) throws Exception {
+    if (OptionsResolver.isBulkInsertOperation(conf)) {
+      return new BulkInsertFunctionWrapper<>(basePath, conf);
+    } else if (OptionsResolver.isAppendMode(conf)) {
+      return new InsertFunctionWrapper<>(basePath, conf);
+    } else if (OptionsResolver.isBucketIndexType(conf)) {
+      if (OptionsResolver.isConsistentHashingBucketIndexType(conf)) {
+        return new ConsistentBucketStreamWriteFunctionWrapper<>(basePath, conf);
+      } else {
+        return new BucketStreamWriteFunctionWrapper<>(basePath, conf);
+      }
+    } else {
+      return new StreamWriteFunctionWrapper<>(basePath, conf);
+    }
   }
 
   private static String toStringSafely(Object obj) {
@@ -466,6 +676,16 @@ public class TestData {
   }
 
   /**
+   * Assert that expected and actual collection of rows are equal regardless of the order.
+   *
+   * @param expected expected row collection
+   * @param actual actual row collection
+   */
+  public static void assertRowsEqualsUnordered(Collection<Row> expected, Collection<Row> actual) {
+    assertEquals(new HashSet<>(expected), new HashSet<>(actual));
+  }
+
+  /**
    * Checks the source data set are written as expected.
    *
    * <p>Note: Replace it with the Flink reader when it is supported.
@@ -492,6 +712,25 @@ public class TestData {
       File baseFile,
       Map<String, String> expected,
       int partitions) throws IOException {
+    checkWrittenData(baseFile, expected, partitions, TestData::filterOutVariables);
+  }
+
+  /**
+   * Checks the source data set are written as expected.
+   *
+   * <p>Note: Replace it with the Flink reader when it is supported.
+   *
+   * @param baseFile   The file base to check, should be a directory
+   * @param expected   The expected results mapping, the key should be the partition path
+   *                   and value should be values list with the key partition
+   * @param partitions The expected partition number
+   * @param extractor  The fields extractor
+   */
+  public static void checkWrittenData(
+      File baseFile,
+      Map<String, String> expected,
+      int partitions,
+      Function<GenericRecord, String> extractor) throws IOException {
     assert baseFile.isDirectory();
     FileFilter filter = file -> !file.getName().startsWith(".");
     File[] partitionDirs = baseFile.listFiles(filter);
@@ -508,7 +747,7 @@ public class TestData {
       List<String> readBuffer = new ArrayList<>();
       GenericRecord nextRecord = reader.read();
       while (nextRecord != null) {
-        readBuffer.add(filterOutVariables(nextRecord));
+        readBuffer.add(extractor.apply(nextRecord));
         nextRecord = reader.read();
       }
       readBuffer.sort(Comparator.naturalOrder());
@@ -566,14 +805,30 @@ public class TestData {
    * @param basePath The file base to check, should be a directory
    * @param expected The expected results mapping, the key should be the partition path
    */
-  public static void checkWrittenFullData(
+  public static void checkWrittenDataCOW(
       File basePath,
       Map<String, List<String>> expected) throws IOException {
+    checkWrittenDataCOW(basePath, expected, TestData::filterOutVariables);
+  }
+
+  /**
+   * Checks the source data are written as expected.
+   *
+   * <p>Note: Replace it with the Flink reader when it is supported.
+   *
+   * @param basePath The file base to check, should be a directory
+   * @param expected The expected results mapping, the key should be the partition path
+   * @param extractor The extractor to extract the required fields from the avro row
+   */
+  public static void checkWrittenDataCOW(
+      File basePath,
+      Map<String, List<String>> expected,
+      Function<GenericRecord, String> extractor) throws IOException {
 
     // 1. init flink table
-    HoodieTableMetaClient metaClient = HoodieTestUtils.init(basePath.getAbsolutePath());
-    HoodieWriteConfig config = HoodieWriteConfig.newBuilder().withPath(basePath.getAbsolutePath()).build();
-    HoodieFlinkTable table = HoodieFlinkTable.create(config, HoodieFlinkEngineContext.DEFAULT, metaClient);
+    HoodieTableMetaClient metaClient = createMetaClient(basePath.toURI().toString());
+    HoodieWriteConfig config = HoodieWriteConfig.newBuilder().withPath(basePath.toURI().toString()).build();
+    HoodieFlinkTable<?> table = HoodieFlinkTable.create(config, HoodieFlinkEngineContext.DEFAULT, metaClient);
 
     // 2. check each partition data
     expected.forEach((partition, partitionDataSet) -> {
@@ -587,7 +842,7 @@ public class TestData {
               ParquetReader<GenericRecord> reader = AvroParquetReader.<GenericRecord>builder(new Path(path)).build();
               GenericRecord nextRecord = reader.read();
               while (nextRecord != null) {
-                readBuffer.add(filterOutVariables(nextRecord));
+                readBuffer.add(extractor.apply(nextRecord));
                 nextRecord = reader.read();
               }
             } catch (IOException e) {
@@ -595,8 +850,11 @@ public class TestData {
             }
           });
 
-      assertTrue(partitionDataSet.size() == readBuffer.size() && partitionDataSet.containsAll(readBuffer));
-
+      assertThat("Unexpected records number under partition: " + partition,
+          readBuffer.size(), is(partitionDataSet.size()));
+      for (String record : readBuffer) {
+        assertTrue(partitionDataSet.contains(record), "Unexpected record: " + record);
+      }
     });
 
   }
@@ -606,48 +864,90 @@ public class TestData {
    *
    * <p>Note: Replace it with the Flink reader when it is supported.
    *
-   * @param fs            The file system
-   * @param latestInstant The latest committed instant of current table
-   * @param baseFile      The file base to check, should be a directory
-   * @param expected      The expected results mapping, the key should be the partition path
-   * @param partitions    The expected partition number
-   * @param schema        The read schema
+   * @param storage    {@link HoodieStorage} instance.
+   * @param baseFile   The file base to check, should be a directory
+   * @param expected   The expected results mapping, the key should be the partition path
+   * @param partitions The expected partition number
    */
   public static void checkWrittenDataMOR(
-      FileSystem fs,
-      String latestInstant,
+      HoodieStorage storage,
       File baseFile,
       Map<String, String> expected,
-      int partitions,
-      Schema schema) {
+      int partitions) throws Exception {
     assert baseFile.isDirectory() : "Base path should be a directory";
-    FileFilter partitionFilter = file -> !file.getName().startsWith(".");
-    File[] partitionDirs = baseFile.listFiles(partitionFilter);
+    String basePath = baseFile.getAbsolutePath();
+    File hoodiePropertiesFile = new File(baseFile + "/" + METAFOLDER_NAME + "/" + HOODIE_PROPERTIES_FILE);
+    assert hoodiePropertiesFile.exists();
+    // 1. init flink table
+    HoodieWriteConfig config = HoodieWriteConfig.newBuilder()
+        .fromFile(hoodiePropertiesFile)
+        .withPath(basePath).build();
+    HoodieTableMetaClient metaClient = createMetaClient(basePath);
+    HoodieFlinkTable<?> table = HoodieFlinkTable.create(config, HoodieFlinkEngineContext.DEFAULT, metaClient);
+    Schema schema = new TableSchemaResolver(metaClient).getTableAvroSchema();
+
+    String latestInstant = metaClient.getActiveTimeline().filterCompletedInstants()
+        .lastInstant().map(HoodieInstant::requestedTime).orElse(null);
+    assertNotNull(latestInstant, "No completed commit under table path" + basePath);
+
+    File[] partitionDirs = baseFile.listFiles(file -> !file.getName().startsWith(".") && file.isDirectory());
     assertNotNull(partitionDirs);
-    assertThat(partitionDirs.length, is(partitions));
+    assertThat("The partitions number should be: " + partitions, partitionDirs.length, is(partitions));
+
+    // 2. check each partition data
+    final int[] requiredPos = IntStream.range(0, schema.getFields().size()).toArray();
     for (File partitionDir : partitionDirs) {
-      File[] dataFiles = partitionDir.listFiles(file ->
-          file.getName().contains(".log.") && !file.getName().startsWith(".."));
-      assertNotNull(dataFiles);
-      HoodieMergedLogRecordScanner scanner = getScanner(
-          fs, baseFile.getPath(), Arrays.stream(dataFiles).map(File::getAbsolutePath)
-              .sorted(Comparator.naturalOrder()).collect(Collectors.toList()),
-          schema, latestInstant);
-      List<String> readBuffer = scanner.getRecords().values().stream()
-          .map(hoodieRecord -> {
-            try {
-              // in case it is a delete
-              GenericRecord record = (GenericRecord) hoodieRecord.getData()
-                  .getInsertValue(schema, new Properties())
-                  .orElse(null);
-              return record == null ? (String) null : filterOutVariables(record);
-            } catch (IOException e) {
-              throw new RuntimeException(e);
+      List<String> readBuffer = new ArrayList<>();
+      List<FileSlice> fileSlices = table.getSliceView().getLatestMergedFileSlicesBeforeOrOn(partitionDir.getName(), latestInstant).collect(Collectors.toList());
+      for (FileSlice fileSlice : fileSlices) {
+        HoodieMergedLogRecordScanner scanner = null;
+        List<String> logPaths = fileSlice.getLogFiles()
+            .sorted(HoodieLogFile.getLogFileComparator())
+            .map(logFile -> logFile.getPath().toString())
+            .collect(Collectors.toList());
+        if (logPaths.size() > 0) {
+          scanner = getScanner(storage, basePath, logPaths, schema, latestInstant);
+        }
+        String baseFilePath = fileSlice.getBaseFile().map(BaseFile::getPath).orElse(null);
+        Set<String> keyToSkip = new HashSet<>();
+        if (baseFilePath != null) {
+          // read the base file first
+          GenericRecordBuilder recordBuilder = new GenericRecordBuilder(schema);
+          ParquetReader<GenericRecord> reader = AvroParquetReader.<GenericRecord>builder(new Path(baseFilePath)).build();
+          GenericRecord currentRecord = reader.read();
+          while (currentRecord != null) {
+            String curKey = currentRecord.get(HOODIE_RECORD_KEY_COL_POS).toString();
+            if (scanner != null && scanner.getRecords().containsKey(curKey)) {
+              keyToSkip.add(curKey);
+              // merge row with log.
+              final HoodieAvroRecord<?> record = (HoodieAvroRecord<?>) scanner.getRecords().get(curKey);
+              Option<IndexedRecord> combineResult = record.getData().combineAndGetUpdateValue(currentRecord, schema, config.getProps());
+              if (combineResult.isPresent()) {
+                GenericRecord avroRecord = buildAvroRecordBySchema(combineResult.get(), schema, requiredPos, recordBuilder);
+                readBuffer.add(filterOutVariables(avroRecord));
+              }
+            } else {
+              readBuffer.add(filterOutVariables(currentRecord));
             }
-          })
-          .filter(Objects::nonNull)
-          .sorted(Comparator.naturalOrder())
-          .collect(Collectors.toList());
+            currentRecord = reader.read();
+          }
+        }
+        // read the remaining log data.
+        if (scanner != null) {
+          for (String curKey : scanner.getRecords().keySet()) {
+            if (!keyToSkip.contains(curKey)) {
+              Option<GenericRecord> record = (Option<GenericRecord>) ((HoodieAvroRecord) scanner.getRecords()
+                      .get(curKey)).getData()
+                      .getInsertValue(schema, config.getProps());
+              if (record.isPresent()) {
+                readBuffer.add(filterOutVariables(record.get()));
+              }
+            }
+          }
+        }
+      }
+      // Ensure that to write and read sequences are consistent.
+      readBuffer.sort(String::compareTo);
       assertThat(readBuffer.toString(), is(expected.get(partitionDir.getName())));
     }
   }
@@ -656,18 +956,17 @@ public class TestData {
    * Returns the scanner to read avro log files.
    */
   private static HoodieMergedLogRecordScanner getScanner(
-      FileSystem fs,
+      HoodieStorage storage,
       String basePath,
       List<String> logPaths,
       Schema readSchema,
       String instant) {
     return HoodieMergedLogRecordScanner.newBuilder()
-        .withFileSystem(fs)
+        .withStorage(storage)
         .withBasePath(basePath)
         .withLogFilePaths(logPaths)
         .withReaderSchema(readSchema)
         .withLatestInstantTime(instant)
-        .withReadBlocksLazily(false)
         .withReverseReader(false)
         .withBufferSize(16 * 1024 * 1024)
         .withMaxMemorySizeInBytes(1024 * 1024L)
@@ -682,14 +981,22 @@ public class TestData {
    */
   private static String filterOutVariables(GenericRecord genericRecord) {
     List<String> fields = new ArrayList<>();
-    fields.add(genericRecord.get("_hoodie_record_key").toString());
-    fields.add(genericRecord.get("_hoodie_partition_path").toString());
-    fields.add(genericRecord.get("uuid").toString());
-    fields.add(genericRecord.get("name").toString());
-    fields.add(genericRecord.get("age").toString());
+    fields.add(getFieldValue(genericRecord, "_hoodie_record_key"));
+    fields.add(getFieldValue(genericRecord, "_hoodie_partition_path"));
+    fields.add(getFieldValue(genericRecord, "uuid"));
+    fields.add(getFieldValue(genericRecord, "name"));
+    fields.add(getFieldValue(genericRecord, "age"));
     fields.add(genericRecord.get("ts").toString());
     fields.add(genericRecord.get("partition").toString());
-    return Strings.join(fields, ",");
+    return String.join(",", fields);
+  }
+
+  private static String getFieldValue(GenericRecord genericRecord, String fieldName) {
+    if (genericRecord.get(fieldName) != null) {
+      return genericRecord.get(fieldName).toString();
+    } else {
+      return null;
+    }
   }
 
   public static BinaryRowData insertRow(Object... fields) {
@@ -734,5 +1041,52 @@ public class TestData {
     BinaryRowData rowData = insertRow(fields);
     rowData.setRowKind(RowKind.UPDATE_AFTER);
     return rowData;
+  }
+
+  /**
+   * Creates row with specified field values.
+   * <p>This method is used to define row in convenient way such as:
+   *
+   * <pre> {@code
+   * row(1, array("abc1", "def1"), map("abc1", 1, "def1", 3), row(1, "abc1"))
+   * }</pre>
+   */
+  public static Row row(Object... values) {
+    return Row.of(values);
+  }
+
+  /**
+   * Creates array with specified values.
+   * <p>This method is used to define row in convenient way such as:
+   *
+   * <pre> {@code
+   * row(1, array("abc1", "def1"), map("abc1", 1, "def1", 3), row(1, "abc1"))
+   * }</pre>
+   */
+  @SafeVarargs
+  public static <T> T[] array(T... values) {
+    return values;
+  }
+
+  /**
+   * Creates map with specified keys and values.
+   * <p>This method is used to define row in convenient way such as:
+   *
+   * <pre> {@code
+   * row(1, array("abc1", "def1"), map("abc1", 1, "def1", 3), row(1, "abc1"))
+   * }</pre>
+   *
+   * <p>NOTE: be careful of the order of keys and values. If you make
+   * a mistake, {@link ClassCastException} will occur later than the
+   * creation of the map due to type erasure.
+   */
+  public static <K, V> Map<K, V> map(Object... kwargs) {
+    HashMap<Object, Object> map = new HashMap<>();
+    for (int i = 0; i < kwargs.length; i += 2) {
+      map.put(kwargs[i], kwargs[i + 1]);
+    }
+    @SuppressWarnings("unchecked")
+    Map<K, V> resultMap = (Map<K, V>) map;
+    return resultMap;
   }
 }

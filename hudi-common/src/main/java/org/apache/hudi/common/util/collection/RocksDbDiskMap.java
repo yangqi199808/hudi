@@ -21,8 +21,8 @@ package org.apache.hudi.common.util.collection;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.exception.HoodieNotSupportedException;
 
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.Serializable;
@@ -33,6 +33,7 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.Spliterators;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
@@ -48,7 +49,7 @@ public final class RocksDbDiskMap<T extends Serializable, R extends Serializable
   //
   private static final String ROCKSDB_COL_FAMILY = "rocksdb-diskmap";
 
-  private static final Logger LOG = LogManager.getLogger(RocksDbDiskMap.class);
+  private static final Logger LOG = LoggerFactory.getLogger(RocksDbDiskMap.class);
   // Stores the key and corresponding value's latest metadata spilled to disk
   private final Set<T> keySet;
   private RocksDBDAO rocksDb;
@@ -138,7 +139,15 @@ public final class RocksDbDiskMap<T extends Serializable, R extends Serializable
    */
   @Override
   public Iterator<R> iterator() {
-    return getRocksDb().iterator(ROCKSDB_COL_FAMILY);
+    return new MappingIterator<Pair<T, R>, R>(getRocksDb().iterator(ROCKSDB_COL_FAMILY), Pair::getValue);
+  }
+
+  /**
+   * Custom iterator to iterate over values written to disk with a key filter.
+   */
+  @Override
+  public Iterator<R> iterator(Predicate<T> filter) {
+    return new MappingIterator<Pair<T, R>, R>(new FilterIterator<>(getRocksDb().iterator(ROCKSDB_COL_FAMILY), pair -> filter.test(pair.getKey())), Pair::getValue);
   }
 
   @Override

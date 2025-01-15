@@ -23,14 +23,14 @@ import org.apache.hudi.hive.HoodieHiveSyncException;
 import org.apache.hudi.hive.SchemaDifference;
 
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
 import org.apache.parquet.schema.DecimalMetadata;
 import org.apache.parquet.schema.GroupType;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.OriginalType;
 import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.Type;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -42,13 +42,28 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import static org.apache.hudi.hive.HiveSyncConfigHolder.HIVE_CREATE_MANAGED_TABLE;
+import static org.apache.hudi.hive.HiveSyncConfigHolder.HIVE_SUPPORT_TIMESTAMP_TYPE;
+import static org.apache.hudi.hive.HiveSyncConfigHolder.HIVE_SYNC_BUCKET_SYNC_SPEC;
+import static org.apache.hudi.sync.common.HoodieSyncConfig.META_SYNC_DATABASE_NAME;
+import static org.apache.hudi.sync.common.HoodieSyncConfig.META_SYNC_PARTITION_FIELDS;
+
 /**
  * Schema Utilities.
  */
 public class HiveSchemaUtil {
 
-  private static final Logger LOG = LogManager.getLogger(HiveSchemaUtil.class);
+  private static final Logger LOG = LoggerFactory.getLogger(HiveSchemaUtil.class);
   public static final String HIVE_ESCAPE_CHARACTER = "`";
+
+  public static final String BOOLEAN_TYPE_NAME = "boolean";
+  public static final String INT_TYPE_NAME = "int";
+  public static final String BIGINT_TYPE_NAME = "bigint";
+  public static final String FLOAT_TYPE_NAME = "float";
+  public static final String DOUBLE_TYPE_NAME = "double";
+  public static final String STRING_TYPE_NAME = "string";
+  public static final String BINARY_TYPE_NAME = "binary";
+  public static final String DATE_TYPE_NAME = "date";
 
   /**
    * Get the schema difference between the storage schema and hive table schema.
@@ -97,12 +112,6 @@ public class HiveSchemaUtil {
         expectedType = expectedType.replaceAll("`", "");
 
         if (!tableColumnType.equalsIgnoreCase(expectedType)) {
-          // check for incremental queries, the schema type change is allowed as per evolution
-          // rules
-          if (!isSchemaTypeUpdateAllowed(tableColumnType, expectedType)) {
-            throw new HoodieHiveSyncException("Could not convert field Type from " + tableColumnType + " to "
-                + expectedType + " for field " + fieldName);
-          }
           schemaDiffBuilder.updateTableColumn(fieldName, getExpectedType(newTableSchema, tickSurroundedFieldName));
         }
       }
@@ -156,7 +165,7 @@ public class HiveSchemaUtil {
    * @return : Hive Table schema read from parquet file List[FieldSchema] without partitionField
    */
   public static List<FieldSchema> convertParquetSchemaToHiveFieldSchema(MessageType messageType, HiveSyncConfig syncConfig) throws IOException {
-    return convertMapSchemaToHiveFieldSchema(parquetSchemaToMapSchema(messageType, syncConfig.supportTimestamp, false), syncConfig);
+    return convertMapSchemaToHiveFieldSchema(parquetSchemaToMapSchema(messageType, syncConfig.getBoolean(HIVE_SUPPORT_TIMESTAMP_TYPE), false), syncConfig);
   }
 
   /**
@@ -202,7 +211,7 @@ public class HiveSchemaUtil {
   public static List<FieldSchema> convertMapSchemaToHiveFieldSchema(LinkedHashMap<String, String> schema, HiveSyncConfig syncConfig) throws IOException {
     return schema.keySet().stream()
         .map(key -> new FieldSchema(key, schema.get(key).toLowerCase(), ""))
-        .filter(field -> !syncConfig.partitionFields.contains(field.getName()))
+        .filter(field -> !syncConfig.getSplitStrings(META_SYNC_PARTITION_FIELDS).contains(field.getName()))
         .collect(Collectors.toList());
   }
 
@@ -224,7 +233,7 @@ public class HiveSchemaUtil {
             .append(decimalMetadata.getScale()).append(")").toString();
       } else if (originalType == OriginalType.DATE) {
         return field.append("DATE").toString();
-      } else if (supportTimestamp && originalType == OriginalType.TIMESTAMP_MICROS) {
+      } else if (supportTimestamp && (originalType == OriginalType.TIMESTAMP_MICROS || originalType == OriginalType.TIMESTAMP_MILLIS)) {
         return field.append("TIMESTAMP").toString();
       }
 
@@ -232,17 +241,17 @@ public class HiveSchemaUtil {
       return parquetPrimitiveTypeName.convert(new PrimitiveType.PrimitiveTypeNameConverter<String, RuntimeException>() {
         @Override
         public String convertBOOLEAN(PrimitiveType.PrimitiveTypeName primitiveTypeName) {
-          return "boolean";
+          return BOOLEAN_TYPE_NAME;
         }
 
         @Override
         public String convertINT32(PrimitiveType.PrimitiveTypeName primitiveTypeName) {
-          return "int";
+          return INT_TYPE_NAME;
         }
 
         @Override
         public String convertINT64(PrimitiveType.PrimitiveTypeName primitiveTypeName) {
-          return "bigint";
+          return BIGINT_TYPE_NAME;
         }
 
         @Override
@@ -252,25 +261,25 @@ public class HiveSchemaUtil {
 
         @Override
         public String convertFLOAT(PrimitiveType.PrimitiveTypeName primitiveTypeName) {
-          return "float";
+          return FLOAT_TYPE_NAME;
         }
 
         @Override
         public String convertDOUBLE(PrimitiveType.PrimitiveTypeName primitiveTypeName) {
-          return "double";
+          return DOUBLE_TYPE_NAME;
         }
 
         @Override
         public String convertFIXED_LEN_BYTE_ARRAY(PrimitiveType.PrimitiveTypeName primitiveTypeName) {
-          return "binary";
+          return BINARY_TYPE_NAME;
         }
 
         @Override
         public String convertBINARY(PrimitiveType.PrimitiveTypeName primitiveTypeName) {
           if (originalType == OriginalType.UTF8 || originalType == OriginalType.ENUM) {
-            return "string";
+            return STRING_TYPE_NAME;
           } else {
-            return "binary";
+            return BINARY_TYPE_NAME;
           }
         }
       });
@@ -308,7 +317,7 @@ public class HiveSchemaUtil {
             return createHiveMap(convertField(keyType, supportTimestamp, doFormat), convertField(valueType, supportTimestamp, doFormat), doFormat);
           case ENUM:
           case UTF8:
-            return "string";
+            return STRING_TYPE_NAME;
           case MAP_KEY_VALUE:
             // MAP_KEY_VALUE was supposed to be used to annotate key and
             // value group levels in a
@@ -406,23 +415,6 @@ public class HiveSchemaUtil {
     return array.toString();
   }
 
-  public static boolean isSchemaTypeUpdateAllowed(String prevType, String newType) {
-    if (prevType == null || prevType.trim().isEmpty() || newType == null || newType.trim().isEmpty()) {
-      return false;
-    }
-    prevType = prevType.toLowerCase();
-    newType = newType.toLowerCase();
-    if (prevType.equals(newType)) {
-      return true;
-    } else if (prevType.equalsIgnoreCase("int") && newType.equalsIgnoreCase("bigint")) {
-      return true;
-    } else if (prevType.equalsIgnoreCase("float") && newType.equalsIgnoreCase("double")) {
-      return true;
-    } else {
-      return prevType.contains("struct") && newType.toLowerCase().contains("struct");
-    }
-  }
-
   public static String generateSchemaString(MessageType storageSchema) throws IOException {
     return generateSchemaString(storageSchema, Collections.EMPTY_LIST);
   }
@@ -448,11 +440,11 @@ public class HiveSchemaUtil {
   public static String generateCreateDDL(String tableName, MessageType storageSchema, HiveSyncConfig config, String inputFormatClass,
                                          String outputFormatClass, String serdeClass, Map<String, String> serdeProperties,
                                          Map<String, String> tableProperties) throws IOException {
-    Map<String, String> hiveSchema = convertParquetSchemaToHiveSchema(storageSchema, config.supportTimestamp);
-    String columns = generateSchemaString(storageSchema, config.partitionFields, config.supportTimestamp);
+    Map<String, String> hiveSchema = convertParquetSchemaToHiveSchema(storageSchema, config.getBoolean(HIVE_SUPPORT_TIMESTAMP_TYPE));
+    String columns = generateSchemaString(storageSchema, config.getSplitStrings(META_SYNC_PARTITION_FIELDS), config.getBoolean(HIVE_SUPPORT_TIMESTAMP_TYPE));
 
     List<String> partitionFields = new ArrayList<>();
-    for (String partitionKey : config.partitionFields) {
+    for (String partitionKey : config.getSplitStrings(META_SYNC_PARTITION_FIELDS)) {
       String partitionKeyWithTicks = tickSurround(partitionKey);
       partitionFields.add(new StringBuilder().append(partitionKeyWithTicks).append(" ")
           .append(getPartitionKeyType(hiveSchema, partitionKeyWithTicks)).toString());
@@ -460,26 +452,26 @@ public class HiveSchemaUtil {
 
     String partitionsStr = String.join(",", partitionFields);
     StringBuilder sb = new StringBuilder();
-    if (config.createManagedTable) {
+    if (config.getBoolean(HIVE_CREATE_MANAGED_TABLE)) {
       sb.append("CREATE TABLE IF NOT EXISTS ");
     } else {
       sb.append("CREATE EXTERNAL TABLE IF NOT EXISTS ");
     }
-    sb.append(HIVE_ESCAPE_CHARACTER).append(config.databaseName).append(HIVE_ESCAPE_CHARACTER)
+    sb.append(HIVE_ESCAPE_CHARACTER).append(config.getStringOrDefault(META_SYNC_DATABASE_NAME)).append(HIVE_ESCAPE_CHARACTER)
             .append(".").append(HIVE_ESCAPE_CHARACTER).append(tableName).append(HIVE_ESCAPE_CHARACTER);
     sb.append("( ").append(columns).append(")");
-    if (!config.partitionFields.isEmpty()) {
+    if (!config.getSplitStrings(META_SYNC_PARTITION_FIELDS).isEmpty()) {
       sb.append(" PARTITIONED BY (").append(partitionsStr).append(")");
     }
-    if (config.bucketSpec != null) {
-      sb.append(' ' + config.bucketSpec + ' ');
+    if (config.getString(HIVE_SYNC_BUCKET_SYNC_SPEC) != null) {
+      sb.append(' ' + config.getString(HIVE_SYNC_BUCKET_SYNC_SPEC) + ' ');
     }
     sb.append(" ROW FORMAT SERDE '").append(serdeClass).append("'");
     if (serdeProperties != null && !serdeProperties.isEmpty()) {
       sb.append(" WITH SERDEPROPERTIES (").append(propertyToString(serdeProperties)).append(")");
     }
     sb.append(" STORED AS INPUTFORMAT '").append(inputFormatClass).append("'");
-    sb.append(" OUTPUTFORMAT '").append(outputFormatClass).append("' LOCATION '").append(config.basePath).append("'");
+    sb.append(" OUTPUTFORMAT '").append(outputFormatClass).append("' LOCATION '").append(config.getAbsoluteBasePath()).append("'");
 
     if (tableProperties != null && !tableProperties.isEmpty()) {
       sb.append(" TBLPROPERTIES(").append(propertyToString(tableProperties)).append(")");
@@ -510,6 +502,6 @@ public class HiveSchemaUtil {
     // Default the unknown partition fields to be String
     // TODO - all partition fields should be part of the schema. datestr is treated as special.
     // Dont do that
-    return "String";
+    return STRING_TYPE_NAME;
   }
 }

@@ -25,6 +25,7 @@ import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.internal.BaseDefaultSource;
 import org.apache.hudi.internal.DataSourceInternalWriterHelper;
 
+import org.apache.spark.sql.HoodieDataTypeUtils;
 import org.apache.spark.sql.connector.catalog.Table;
 import org.apache.spark.sql.connector.catalog.TableProvider;
 import org.apache.spark.sql.connector.expressions.Transform;
@@ -34,8 +35,6 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import java.util.HashMap;
 import java.util.Map;
 
-import static org.apache.hudi.DataSourceUtils.mayBeOverwriteParquetWriteLegacyFormatProp;
-
 /**
  * DataSource V2 implementation for managing internal write logic. Only called internally.
  * This class is only compatible with datasource V2 API in Spark 3.
@@ -44,7 +43,8 @@ public class DefaultSource extends BaseDefaultSource implements TableProvider {
 
   @Override
   public StructType inferSchema(CaseInsensitiveStringMap options) {
-    return StructType.fromDDL(options.get(HoodieInternalConfig.BULKINSERT_INPUT_DATA_SCHEMA_DDL.key()));
+    String jsonSchema = options.get(HoodieInternalConfig.BULKINSERT_INPUT_DATA_SCHEMA_DDL.key());
+    return HoodieDataTypeUtils.parseStructTypeFromJson(jsonSchema);
   }
 
   @Override
@@ -59,7 +59,7 @@ public class DefaultSource extends BaseDefaultSource implements TableProvider {
     // Create a new map as the properties is an unmodifiableMap on Spark 3.2.0
     Map<String, String> newProps = new HashMap<>(properties);
     // Auto set the value of "hoodie.parquet.writelegacyformat.enabled"
-    mayBeOverwriteParquetWriteLegacyFormatProp(newProps, schema);
+    HoodieDataTypeUtils.tryOverrideParquetWriteLegacyFormatProperty(newProps, schema);
     // 1st arg to createHoodieConfig is not really required to be set. but passing it anyways.
     HoodieWriteConfig config = DataSourceUtils.createHoodieConfig(newProps.get(HoodieWriteConfig.AVRO_SCHEMA_STRING.key()), path, tblName, newProps);
     return new HoodieDataSourceInternalTable(instantTime, config, schema, getSparkSession(),

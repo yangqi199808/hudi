@@ -18,25 +18,29 @@
 
 package org.apache.hudi.table.marker;
 
-import org.apache.hudi.common.config.SerializableConfiguration;
+import org.apache.hudi.common.conflict.detection.DirectMarkerBasedDetectionStrategy;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.IOType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.marker.MarkerType;
+import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.util.HoodieTimer;
 import org.apache.hudi.common.util.MarkerUtils;
 import org.apache.hudi.common.util.Option;
+import org.apache.hudi.common.util.ReflectionUtils;
+import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.exception.HoodieIOException;
+import org.apache.hudi.storage.HoodieStorage;
+import org.apache.hudi.storage.HoodieStorageUtils;
+import org.apache.hudi.storage.StorageConfiguration;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.StoragePathInfo;
 import org.apache.hudi.table.HoodieTable;
 
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.LocatedFileStatus;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.fs.RemoteIterator;
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -44,23 +48,25 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import static org.apache.hudi.table.marker.ConflictDetectionUtils.getDefaultEarlyConflictDetectionStrategy;
+
 /**
  * Marker operations of directly accessing the file system to create and delete
  * marker files.  Each data file has a corresponding marker file.
  */
 public class DirectWriteMarkers extends WriteMarkers {
 
-  private static final Logger LOG = LogManager.getLogger(DirectWriteMarkers.class);
-  private final transient FileSystem fs;
+  private static final Logger LOG = LoggerFactory.getLogger(DirectWriteMarkers.class);
+  private final transient HoodieStorage storage;
 
-  public DirectWriteMarkers(FileSystem fs, String basePath, String markerFolderPath, String instantTime) {
+  public DirectWriteMarkers(HoodieStorage storage, String basePath, String markerFolderPath, String instantTime) {
     super(basePath, markerFolderPath, instantTime);
-    this.fs = fs;
+    this.storage = storage;
   }
 
   public DirectWriteMarkers(HoodieTable table, String instantTime) {
-    this(table.getMetaClient().getFs(),
-        table.getMetaClient().getBasePath(),
+    this(table.getStorage(),
+        table.getMetaClient().getBasePath().toString(),
         table.getMetaClient().getMarkerFolderPath(instantTime),
         instantTime);
   }
@@ -72,7 +78,7 @@ public class DirectWriteMarkers extends WriteMarkers {
    * @param parallelism parallelism for deletion.
    */
   public boolean deleteMarkerDir(HoodieEngineContext context, int parallelism) {
-    return FSUtils.deleteDir(context, fs, markerDirPath, parallelism);
+    return FSUtils.deleteDir(context, storage, markerDirPath, parallelism);
   }
 
   /**
@@ -80,43 +86,38 @@ public class DirectWriteMarkers extends WriteMarkers {
    * @throws IOException
    */
   public boolean doesMarkerDirExist() throws IOException {
-    return fs.exists(markerDirPath);
+    return storage.exists(markerDirPath);
   }
 
   @Override
   public Set<String> createdAndMergedDataPaths(HoodieEngineContext context, int parallelism) throws IOException {
     Set<String> dataFiles = new HashSet<>();
 
-    FileStatus[] topLevelStatuses = fs.listStatus(markerDirPath);
+    List<StoragePathInfo> topLevelInfoList = storage.listDirectEntries(markerDirPath);
     List<String> subDirectories = new ArrayList<>();
-    for (FileStatus topLevelStatus: topLevelStatuses) {
-      if (topLevelStatus.isFile()) {
-        String pathStr = topLevelStatus.getPath().toString();
+    for (StoragePathInfo topLevelInfo: topLevelInfoList) {
+      if (topLevelInfo.isFile()) {
+        String pathStr = topLevelInfo.getPath().toString();
         if (pathStr.contains(HoodieTableMetaClient.MARKER_EXTN) && !pathStr.endsWith(IOType.APPEND.name())) {
           dataFiles.add(translateMarkerToDataPath(pathStr));
         }
       } else {
-        subDirectories.add(topLevelStatus.getPath().toString());
+        subDirectories.add(topLevelInfo.getPath().toString());
       }
     }
 
-    if (subDirectories.size() > 0) {
+    if (!subDirectories.isEmpty()) {
       parallelism = Math.min(subDirectories.size(), parallelism);
-      SerializableConfiguration serializedConf = new SerializableConfiguration(fs.getConf());
+      StorageConfiguration<?> storageConf = storage.getConf();
       context.setJobStatus(this.getClass().getSimpleName(), "Obtaining marker files for all created, merged paths");
       dataFiles.addAll(context.flatMap(subDirectories, directory -> {
-        Path path = new Path(directory);
-        FileSystem fileSystem = path.getFileSystem(serializedConf.get());
-        RemoteIterator<LocatedFileStatus> itr = fileSystem.listFiles(path, true);
-        List<String> result = new ArrayList<>();
-        while (itr.hasNext()) {
-          FileStatus status = itr.next();
-          String pathStr = status.getPath().toString();
-          if (pathStr.contains(HoodieTableMetaClient.MARKER_EXTN) && !pathStr.endsWith(IOType.APPEND.name())) {
-            result.add(translateMarkerToDataPath(pathStr));
-          }
-        }
-        return result.stream();
+        StoragePath path = new StoragePath(directory);
+        HoodieStorage storage = HoodieStorageUtils.getStorage(path, storageConf);
+        return storage.listFiles(path).stream()
+            .map(pathInfo -> pathInfo.getPath().toString())
+            .filter(pathStr -> pathStr.contains(HoodieTableMetaClient.MARKER_EXTN)
+                && !pathStr.endsWith(IOType.APPEND.name()))
+            .map(this::translateMarkerToDataPath);
       }, parallelism));
     }
 
@@ -132,7 +133,7 @@ public class DirectWriteMarkers extends WriteMarkers {
   public Set<String> allMarkerFilePaths() throws IOException {
     Set<String> markerFiles = new HashSet<>();
     if (doesMarkerDirExist()) {
-      FSUtils.processFiles(fs, markerDirPath.toString(), fileStatus -> {
+      FSUtils.processFiles(storage, markerDirPath.toString(), fileStatus -> {
         markerFiles.add(MarkerUtils.stripMarkerFolderPrefix(fileStatus.getPath().toString(), basePath, instantTime));
         return true;
       }, false);
@@ -146,32 +147,51 @@ public class DirectWriteMarkers extends WriteMarkers {
    * @param markerName the full marker name, e.g., "2021/08/13/file1.marker.CREATE"
    * @return path of the marker file
    */
-  public Option<Path> create(String markerName) {
-    return create(new Path(markerDirPath, markerName), true);
+  public Option<StoragePath> create(String markerName) {
+    return create(new StoragePath(markerDirPath, markerName), true);
   }
 
   @Override
-  protected Option<Path> create(String partitionPath, String dataFileName, IOType type, boolean checkIfExists) {
+  protected Option<StoragePath> create(String partitionPath, String fileName, IOType type, boolean checkIfExists) {
+    return create(getMarkerPath(partitionPath, fileName, type), checkIfExists);
+  }
+
+  @Override
+  public Option<StoragePath> createWithEarlyConflictDetection(String partitionPath, String dataFileName, IOType type, boolean checkIfExists,
+                                                              HoodieWriteConfig config, String fileId, HoodieActiveTimeline activeTimeline) {
+    String strategyClassName = config.getEarlyConflictDetectionStrategyClassName();
+    if (!ReflectionUtils.isSubClass(strategyClassName, DirectMarkerBasedDetectionStrategy.class)) {
+      LOG.warn("Cannot use " + strategyClassName + " for direct markers.");
+      strategyClassName = getDefaultEarlyConflictDetectionStrategy(MarkerType.DIRECT);
+      LOG.warn("Falling back to " + strategyClassName);
+    }
+    DirectMarkerBasedDetectionStrategy strategy =
+        (DirectMarkerBasedDetectionStrategy) ReflectionUtils.loadClass(strategyClassName,
+            new Class<?>[] {HoodieStorage.class, String.class, String.class, String.class,
+                HoodieActiveTimeline.class, HoodieWriteConfig.class},
+            storage, partitionPath, fileId, instantTime, activeTimeline, config);
+
+    strategy.detectAndResolveConflictIfNecessary();
     return create(getMarkerPath(partitionPath, dataFileName, type), checkIfExists);
   }
 
-  private Option<Path> create(Path markerPath, boolean checkIfExists) {
-    HoodieTimer timer = new HoodieTimer().startTimer();
-    Path dirPath = markerPath.getParent();
+  private Option<StoragePath> create(StoragePath markerPath, boolean checkIfExists) {
+    HoodieTimer timer = HoodieTimer.start();
+    StoragePath dirPath = markerPath.getParent();
     try {
-      if (!fs.exists(dirPath)) {
-        fs.mkdirs(dirPath); // create a new partition as needed.
+      if (!storage.exists(dirPath)) {
+        storage.createDirectory(dirPath); // create a new partition as needed.
       }
     } catch (IOException e) {
       throw new HoodieIOException("Failed to make dir " + dirPath, e);
     }
     try {
-      if (checkIfExists && fs.exists(markerPath)) {
+      if (checkIfExists && storage.exists(markerPath)) {
         LOG.warn("Marker Path=" + markerPath + " already exists, cancel creation");
         return Option.empty();
       }
       LOG.info("Creating Marker Path=" + markerPath);
-      fs.create(markerPath, false).close();
+      storage.create(markerPath, false).close();
     } catch (IOException e) {
       throw new HoodieException("Failed to create marker file " + markerPath, e);
     }

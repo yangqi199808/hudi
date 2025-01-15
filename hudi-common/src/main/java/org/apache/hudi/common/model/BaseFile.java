@@ -18,8 +18,8 @@
 
 package org.apache.hudi.common.model;
 
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.Path;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.StoragePathInfo;
 
 import java.io.Serializable;
 import java.util.Objects;
@@ -31,38 +31,54 @@ import java.util.Objects;
 public class BaseFile implements Serializable {
 
   private static final long serialVersionUID = 1L;
-  private transient FileStatus fileStatus;
+
+  private transient StoragePathInfo pathInfo;
   private final String fullPath;
+  protected final String fileName;
   private long fileLen;
 
   public BaseFile(BaseFile dataFile) {
-    this.fileStatus = dataFile.fileStatus;
-    this.fullPath = dataFile.fullPath;
-    this.fileLen = dataFile.fileLen;
+    this(dataFile.pathInfo,
+        dataFile.fullPath,
+        dataFile.getFileName(),
+        dataFile.getFileLen());
   }
 
-  public BaseFile(FileStatus fileStatus) {
-    this.fileStatus = fileStatus;
-    this.fullPath = fileStatus.getPath().toString();
-    this.fileLen = fileStatus.getLen();
+  public BaseFile(StoragePathInfo pathInfo) {
+    this(pathInfo,
+        pathInfo.getPath().toString(),
+        pathInfo.getPath().getName(),
+        pathInfo.getLength());
   }
 
   public BaseFile(String filePath) {
-    this.fileStatus = null;
-    this.fullPath = filePath;
-    this.fileLen = -1;
+    this(null, filePath, getFileName(filePath), -1);
+  }
+
+  private BaseFile(StoragePathInfo pathInfo, String fullPath, String fileName, long fileLen) {
+    this.pathInfo = pathInfo;
+    this.fullPath = fullPath;
+    this.fileLen = fileLen;
+    this.fileName = fileName;
   }
 
   public String getPath() {
     return fullPath;
   }
 
-  public String getFileName() {
-    return new Path(fullPath).getName();
+  public StoragePath getStoragePath() {
+    if (pathInfo != null) {
+      return pathInfo.getPath();
+    }
+    return new StoragePath(fullPath);
   }
 
-  public FileStatus getFileStatus() {
-    return fileStatus;
+  public String getFileName() {
+    return fileName;
+  }
+
+  public StoragePathInfo getPathInfo() {
+    return pathInfo;
   }
 
   public long getFileSize() {
@@ -97,5 +113,9 @@ public class BaseFile implements Serializable {
   @Override
   public String toString() {
     return "BaseFile{fullPath=" + fullPath + ", fileLen=" + fileLen + '}';
+  }
+
+  private static String getFileName(String fullPath) {
+    return new StoragePath(fullPath).getName();
   }
 }

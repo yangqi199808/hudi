@@ -18,6 +18,9 @@
 
 package org.apache.hudi.table.catalog;
 
+import org.apache.hudi.configuration.HadoopConfigurations;
+import org.apache.hudi.exception.HoodieCatalogException;
+
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.table.catalog.Catalog;
@@ -28,10 +31,8 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
-
-import static org.apache.hudi.table.catalog.CatalogOptions.CATALOG_PATH;
-import static org.apache.hudi.table.catalog.CatalogOptions.DEFAULT_DATABASE;
 
 /**
  * A catalog factory impl that creates {@link HoodieCatalog}.
@@ -50,23 +51,29 @@ public class HoodieCatalogFactory implements CatalogFactory {
   public Catalog createCatalog(Context context) {
     final FactoryUtil.CatalogFactoryHelper helper =
         FactoryUtil.createCatalogFactoryHelper(this, context);
-    helper.validate();
-
-    return new HoodieCatalog(
-        context.getName(),
-        (Configuration) helper.getOptions());
+    helper.validateExcept(HadoopConfigurations.HADOOP_PREFIX);
+    String mode = helper.getOptions().get(CatalogOptions.MODE);
+    switch (mode.toLowerCase(Locale.ROOT)) {
+      case "hms":
+        return new HoodieHiveCatalog(
+            context.getName(),
+            (Configuration) helper.getOptions());
+      case "dfs":
+        return new HoodieCatalog(
+            context.getName(),
+            (Configuration) helper.getOptions());
+      default:
+        throw new HoodieCatalogException(String.format("Invalid catalog mode: %s, supported modes: [hms, dfs].", mode));
+    }
   }
 
   @Override
   public Set<ConfigOption<?>> requiredOptions() {
-    Set<ConfigOption<?>> options = new HashSet<>();
-    options.add(CATALOG_PATH);
-    options.add(DEFAULT_DATABASE);
-    return options;
+    return Collections.emptySet();
   }
 
   @Override
   public Set<ConfigOption<?>> optionalOptions() {
-    return Collections.emptySet();
+    return new HashSet<>(CatalogOptions.allOptions());
   }
 }

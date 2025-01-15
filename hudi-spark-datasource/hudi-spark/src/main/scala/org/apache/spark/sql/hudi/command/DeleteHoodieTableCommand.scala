@@ -17,70 +17,61 @@
 
 package org.apache.spark.sql.hudi.command
 
-import org.apache.hudi.DataSourceWriteOptions.{OPERATION, _}
-import org.apache.hudi.config.HoodieWriteConfig
-import org.apache.hudi.config.HoodieWriteConfig.TBL_NAME
-import org.apache.hudi.hive.HiveSyncConfig
-import org.apache.hudi.hive.ddl.HiveSyncMode
-import org.apache.hudi.{DataSourceWriteOptions, SparkAdapterSupport}
+import org.apache.hudi.DataSourceWriteOptions.{SPARK_SQL_OPTIMIZED_WRITES, SPARK_SQL_WRITES_PREPPED_KEY}
+import org.apache.hudi.SparkAdapterSupport
+
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.catalog.HoodieCatalogTable
-import org.apache.spark.sql.catalyst.plans.logical.DeleteFromTable
-import org.apache.spark.sql.hudi.HoodieSqlCommonUtils._
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.catalyst.plans.logical.{DeleteFromTable, Filter}
+import org.apache.spark.sql.hudi.ProvidesHoodieConfig
+import org.apache.spark.sql.hudi.command.HoodieLeafRunnableCommand.stripMetaFieldAttributes
 
-case class DeleteHoodieTableCommand(deleteTable: DeleteFromTable) extends HoodieLeafRunnableCommand
-  with SparkAdapterSupport {
-
-  private val table = deleteTable.table
-
-  private val tableId = getTableIdentifier(table)
+case class DeleteHoodieTableCommand(dft: DeleteFromTable) extends HoodieLeafRunnableCommand
+  with SparkAdapterSupport
+  with ProvidesHoodieConfig {
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
-    logInfo(s"start execute delete command for $tableId")
+    val catalogTable = sparkAdapter.resolveHoodieTable(dft.table)
+      .map(HoodieCatalogTable(sparkSession, _))
+      .get
 
-    // Remove meta fields from the data frame
-    var df = removeMetaFields(Dataset.ofRows(sparkSession, table))
-    if (deleteTable.condition.isDefined) {
-      df = df.filter(Column(deleteTable.condition.get))
+    val tableId = catalogTable.table.qualifiedName
+
+    logInfo(s"Executing 'DELETE FROM' command for $tableId")
+
+    val condition = sparkAdapter.extractDeleteCondition(dft)
+
+    val targetLogicalPlan = if (sparkSession.sqlContext.conf.getConfString(SPARK_SQL_OPTIMIZED_WRITES.key()
+      , SPARK_SQL_OPTIMIZED_WRITES.defaultValue()) == "true") {
+      dft.table
+    } else {
+      stripMetaFieldAttributes(dft.table)
     }
-    val config = buildHoodieConfig(sparkSession)
-    df.write
-      .format("hudi")
+
+    val filteredPlan = if (condition != null) {
+      Filter(condition, targetLogicalPlan)
+    } else {
+      targetLogicalPlan
+    }
+
+    val config = if (sparkSession.sqlContext.conf.getConfString(SPARK_SQL_OPTIMIZED_WRITES.key()
+      , SPARK_SQL_OPTIMIZED_WRITES.defaultValue()) == "true") {
+      buildHoodieDeleteTableConfig(catalogTable, sparkSession) + (SPARK_SQL_WRITES_PREPPED_KEY -> "true")
+    } else {
+      buildHoodieDeleteTableConfig(catalogTable, sparkSession)
+    }
+
+    val df = Dataset.ofRows(sparkSession, filteredPlan)
+
+    df.write.format("hudi")
       .mode(SaveMode.Append)
       .options(config)
       .save()
-    sparkSession.catalog.refreshTable(tableId.unquotedString)
-    logInfo(s"Finish execute delete command for $tableId")
+
+    sparkSession.catalog.refreshTable(tableId)
+
+    logInfo(s"Finished executing 'DELETE FROM' command for $tableId")
+
     Seq.empty[Row]
-  }
-
-  private def buildHoodieConfig(sparkSession: SparkSession): Map[String, String] = {
-    val hoodieCatalogTable = HoodieCatalogTable(sparkSession, tableId)
-    val path = hoodieCatalogTable.tableLocation
-    val tableConfig = hoodieCatalogTable.tableConfig
-    val tableSchema = hoodieCatalogTable.tableSchema
-    val partitionColumns = tableConfig.getPartitionFieldProp.split(",").map(_.toLowerCase)
-    val partitionSchema = StructType(tableSchema.filter(f => partitionColumns.contains(f.name)))
-
-    assert(hoodieCatalogTable.primaryKeys.nonEmpty,
-      s"There are no primary key defined in table $tableId, cannot execute delete operator")
-    withSparkConf(sparkSession, hoodieCatalogTable.catalogProperties) {
-      Map(
-        "path" -> path,
-        RECORDKEY_FIELD.key -> hoodieCatalogTable.primaryKeys.mkString(","),
-        TBL_NAME.key -> tableConfig.getTableName,
-        HIVE_STYLE_PARTITIONING.key -> tableConfig.getHiveStylePartitioningEnable,
-        URL_ENCODE_PARTITIONING.key -> tableConfig.getUrlEncodePartitioning,
-        KEYGENERATOR_CLASS_NAME.key -> classOf[SqlKeyGenerator].getCanonicalName,
-        SqlKeyGenerator.ORIGIN_KEYGEN_CLASS_NAME -> tableConfig.getKeyGeneratorClassName,
-        OPERATION.key -> DataSourceWriteOptions.DELETE_OPERATION_OPT_VAL,
-        PARTITIONPATH_FIELD.key -> tableConfig.getPartitionFieldProp,
-        HiveSyncConfig.HIVE_SYNC_MODE.key -> HiveSyncMode.HMS.name(),
-        HiveSyncConfig.HIVE_SUPPORT_TIMESTAMP_TYPE.key -> "true",
-        HoodieWriteConfig.DELETE_PARALLELISM_VALUE.key -> "200",
-        SqlKeyGenerator.PARTITION_SCHEMA -> partitionSchema.toDDL
-      )
-    }
   }
 }

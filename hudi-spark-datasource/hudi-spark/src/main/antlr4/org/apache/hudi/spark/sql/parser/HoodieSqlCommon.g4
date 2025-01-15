@@ -42,12 +42,12 @@
 }
 
  singleStatement
-    : statement EOF
+    : statement ';'* EOF
     ;
 
  statement
     : compactionStatement                                                       #compactionCommand
-    | CALL multipartIdentifier '(' (callArgument (',' callArgument)*)? ')'      #call
+    | CALL multipartIdentifier   callArgumentList?    #call
     | .*?                                                                       #passThrough
     ;
 
@@ -60,6 +60,10 @@
 
  tableIdentifier
     : (db=IDENTIFIER '.')? table=IDENTIFIER
+    ;
+
+ callArgumentList
+    : '(' (callArgument (',' callArgument)*)? ')'
     ;
 
  callArgument
@@ -103,6 +107,36 @@
     : parts+=identifier ('.' parts+=identifier)*
     ;
 
+ indexItem
+     :   indexExpressionItem                // For expressions
+     ;
+
+ indexExpressionItem
+     :   indexExpression (OPTIONS options=propertyList)?
+     ;
+
+ indexExpression
+     :   functionCall                     // Function calls like from_unixtime(ts, 'yyyy-MM-dd')
+     // Add more expressions as needed
+     ;
+
+ functionCall
+     :   functionName LEFT_PAREN functionArgs RIGHT_PAREN
+     ;
+
+ functionName
+     :   IDENTIFIER                       // Matches function names like "from_unixtime"
+     ;
+
+ functionArgs
+     :   functionArg (COMMA functionArg)* // A list of arguments separated by commas
+     ;
+
+ functionArg
+     :   STRING                           // Matches string literals like 'yyyy-MM-dd'
+     // Add more types of arguments as needed
+     ;
+
  identifier
     : IDENTIFIER              #unquotedIdentifier
     | quotedIdentifier        #quotedIdentifierAlternative
@@ -114,8 +148,39 @@
     ;
 
  nonReserved
-     : CALL | COMPACTION | RUN | SCHEDULE | ON | SHOW | LIMIT
+     : CALL
+     | COMPACTION
+     | LIMIT
+     | ON
+     | RUN
+     | SCHEDULE
+     | SHOW
      ;
+
+ propertyList
+     : LEFT_PAREN property (COMMA property)* RIGHT_PAREN
+     ;
+
+ property
+     : key=propertyKey (EQ? value=propertyValue)?
+     ;
+
+ propertyKey
+     : identifier (DOT identifier)*
+     | STRING
+     ;
+
+ propertyValue
+     : INTEGER_VALUE
+     | DECIMAL_VALUE
+     | booleanValue
+     | STRING
+     ;
+
+ LEFT_PAREN: '(';
+ RIGHT_PAREN: ')';
+ COMMA: ',';
+ DOT: '.';
 
  ALL: 'ALL';
  AT: 'AT';

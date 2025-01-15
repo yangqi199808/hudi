@@ -17,68 +17,127 @@
 
 package org.apache.spark.sql.hudi.command
 
+import org.apache.hudi.DataSourceWriteOptions.{SPARK_SQL_OPTIMIZED_WRITES, SPARK_SQL_WRITES_PREPPED_KEY}
 import org.apache.hudi.SparkAdapterSupport
-import org.apache.hudi.common.model.HoodieRecord
+
+import org.apache.spark.sql.HoodieCatalystExpressionUtils.attributeEquals
 import org.apache.spark.sql._
+import org.apache.spark.sql.catalyst.analysis.Resolver
 import org.apache.spark.sql.catalyst.catalog.HoodieCatalogTable
+import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
 import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Expression}
-import org.apache.spark.sql.catalyst.plans.logical.{Assignment, UpdateTable}
+import org.apache.spark.sql.catalyst.plans.logical.{Assignment, Filter, LogicalPlan, Project, UpdateTable}
 import org.apache.spark.sql.hudi.HoodieSqlCommonUtils._
 import org.apache.spark.sql.hudi.ProvidesHoodieConfig
-import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.StructField
+import org.apache.spark.sql.hudi.analysis.HoodieAnalysis.failAnalysis
 
-import scala.collection.JavaConverters._
-
-case class UpdateHoodieTableCommand(updateTable: UpdateTable) extends HoodieLeafRunnableCommand
+case class UpdateHoodieTableCommand(ut: UpdateTable) extends HoodieLeafRunnableCommand
   with SparkAdapterSupport with ProvidesHoodieConfig {
 
-  private val table = updateTable.table
-  private val tableId = getTableIdentifier(table)
+  private var sparkSession: SparkSession = _
+
+  private lazy val hoodieCatalogTable = sparkAdapter.resolveHoodieTable(ut.table) match {
+    case Some(catalogTable) => HoodieCatalogTable(sparkSession, catalogTable)
+    case _ =>
+      failAnalysis(s"Failed to resolve update statement into the Hudi table. Got instead: ${ut.table}")
+  }
+
+  /**
+   * Validate there is no assignment clause for the given attribute in the given table.
+   *
+   * @param resolver    The resolver to use
+   * @param fields      The fields from the target table who should not have any assignment clause
+   * @param tableId     Table identifier (for error messages)
+   * @param fieldType   Type of the attribute to be validated (for error messages)
+   * @param assignments The assignments clause
+   *
+   * @throws AnalysisException if assignment clause for the given target table attribute is found
+   */
+  private def validateNoAssignmentsToTargetTableAttr(resolver: Resolver,
+                                                     fields: Seq[String],
+                                                     tableId: String,
+                                                     fieldType: String,
+                                                     assignments: Seq[(AttributeReference, Expression)]
+                                                     ): Unit = {
+    fields.foreach(field => if (assignments.exists {
+      case (attr, _) => resolver(attr.name, field)
+    }) {
+      throw new AnalysisException(s"Detected disallowed assignment clause in UPDATE statement for $fieldType " +
+        s"`$field` for table `$tableId`. Please remove the assignment clause to avoid the error.")
+    })
+  }
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
-    logInfo(s"start execute update command for $tableId")
-    val sqlConf = sparkSession.sessionState.conf
-    val name2UpdateValue = updateTable.assignments.map {
-      case Assignment(attr: AttributeReference, value) =>
-        attr.name -> value
-    }.toMap
+    this.sparkSession = sparkSession
+    val catalogTable = sparkAdapter.resolveHoodieTable(ut.table)
+      .map(HoodieCatalogTable(sparkSession, _))
+      .get
 
-    val updateExpressions = table.output
-      .map(attr => {
-        val UpdateValueOption = name2UpdateValue.find(f => sparkSession.sessionState.conf.resolver(f._1, attr.name))
-        if(UpdateValueOption.isEmpty) attr else UpdateValueOption.get._2
-      })
-      .filter { // filter the meta columns
-        case attr: AttributeReference =>
-          !HoodieRecord.HOODIE_META_COLUMNS.asScala.toSet.contains(attr.name)
-        case _=> true
-      }
+    val tableId = catalogTable.table.qualifiedName
 
-    val projects = updateExpressions.zip(removeMetaFields(table.schema).fields).map {
-      case (attr: AttributeReference, field) =>
-        Column(cast(attr, field, sqlConf))
-      case (exp, field) =>
-        Column(Alias(cast(exp, field, sqlConf), field.name)())
+    logInfo(s"Executing 'UPDATE' command for $tableId")
+
+    val assignedAttributes = ut.assignments.map {
+      case Assignment(attr: AttributeReference, value) => attr -> value
     }
 
-    var df = Dataset.ofRows(sparkSession, table)
-    if (updateTable.condition.isDefined) {
-      df = df.filter(Column(updateTable.condition.get))
+    // We don't support update queries changing partition column value.
+    validateNoAssignmentsToTargetTableAttr(
+      sparkSession.sessionState.conf.resolver,
+      hoodieCatalogTable.tableConfig.getPartitionFields.orElse(Array.empty),
+      tableId,
+      "partition field",
+      assignedAttributes
+    )
+
+    // We don't support update queries changing the primary key column value.
+    validateNoAssignmentsToTargetTableAttr(
+      sparkSession.sessionState.conf.resolver,
+      hoodieCatalogTable.tableConfig.getRecordKeyFields.orElse(Array.empty),
+      tableId,
+      "record key field",
+      assignedAttributes
+    )
+
+    val filteredOutput = if (sparkSession.sqlContext.conf.getConfString(SPARK_SQL_OPTIMIZED_WRITES.key()
+      , SPARK_SQL_OPTIMIZED_WRITES.defaultValue()) == "true") {
+      ut.table.output
+    } else {
+      removeMetaFields(ut.table.output)
     }
-    df = df.select(projects: _*)
-    val config = buildHoodieConfig(HoodieCatalogTable(sparkSession, tableId))
-    df.write
-      .format("hudi")
+
+    val targetExprs = filteredOutput.map { targetAttr =>
+      // NOTE: [[UpdateTable]] permits partial updates and therefore here we correlate assigned
+      //       assigned attributes to the ones of the target table. Ones not being assigned
+      //       will simply be carried over (from the old record)
+      assignedAttributes.find(p => attributeEquals(p._1, targetAttr))
+        .map { case (_, expr) => Alias(castIfNeeded(expr, targetAttr.dataType), targetAttr.name)() }
+        .getOrElse(targetAttr)
+    }
+
+    val condition = ut.condition.getOrElse(TrueLiteral)
+    val filteredPlan = Filter(condition, Project(targetExprs, ut.table))
+
+    val config = if (sparkSession.sqlContext.conf.getConfString(SPARK_SQL_OPTIMIZED_WRITES.key()
+      , SPARK_SQL_OPTIMIZED_WRITES.defaultValue()) == "true") {
+      // Set config to show that this is a prepped write.
+      buildHoodieConfig(catalogTable) + (SPARK_SQL_WRITES_PREPPED_KEY -> "true")
+    } else {
+      buildHoodieConfig(catalogTable)
+    }
+
+    val df = Dataset.ofRows(sparkSession, filteredPlan)
+
+    df.write.format("hudi")
       .mode(SaveMode.Append)
       .options(config)
       .save()
-    sparkSession.catalog.refreshTable(tableId.unquotedString)
-    logInfo(s"Finish execute update command for $tableId")
+
+    sparkSession.catalog.refreshTable(tableId)
+
+    logInfo(s"Finished executing 'UPDATE' command for $tableId")
+
     Seq.empty[Row]
   }
 
-  def cast(exp:Expression, field: StructField, sqlConf: SQLConf): Expression = {
-    castIfNeeded(exp, field.dataType, sqlConf)
-  }
 }

@@ -18,17 +18,13 @@
 
 package org.apache.hudi
 
-import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
-import org.apache.hudi.HoodieBaseRelation.createBaseFileReader
 import org.apache.hudi.HoodieConversionUtils.toScalaOption
-import org.apache.hudi.MergeOnReadSnapshotRelation.getFilePath
-import org.apache.hudi.common.fs.FSUtils.getRelativePartitionPath
-import org.apache.hudi.common.model.{FileSlice, HoodieLogFile}
+import org.apache.hudi.MergeOnReadSnapshotRelation.{createPartitionedFile, isProjectionCompatible}
+import org.apache.hudi.common.model.{FileSlice, HoodieLogFile, OverwriteWithLatestAvroPayload}
 import org.apache.hudi.common.table.HoodieTableMetaClient
-import org.apache.hudi.common.table.view.HoodieTableFileSystemView
-import org.apache.hudi.hadoop.utils.HoodieRealtimeRecordReaderUtils.getMaxCompactionMemoryInBytes
-import org.apache.spark.execution.datasources.HoodieInMemoryFileIndex
+import org.apache.hudi.storage.StoragePath
+
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SQLContext
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Expression
@@ -39,64 +35,92 @@ import org.apache.spark.sql.types.StructType
 import scala.collection.JavaConverters._
 
 case class HoodieMergeOnReadFileSplit(dataFile: Option[PartitionedFile],
-                                      logFiles: Option[List[HoodieLogFile]],
-                                      latestCommit: String,
-                                      tablePath: String,
-                                      maxCompactionMemoryInBytes: Long,
-                                      mergeType: String) extends HoodieFileSplit
+                                      logFiles: List[HoodieLogFile]) extends HoodieFileSplit
 
-class MergeOnReadSnapshotRelation(sqlContext: SQLContext,
-                                  optParams: Map[String, String],
-                                  userSchema: Option[StructType],
-                                  globPaths: Seq[Path],
-                                  metaClient: HoodieTableMetaClient)
-  extends HoodieBaseRelation(sqlContext, metaClient, optParams, userSchema) {
+case class MergeOnReadSnapshotRelation(override val sqlContext: SQLContext,
+                                       override val optParams: Map[String, String],
+                                       override val metaClient: HoodieTableMetaClient,
+                                       private val globPaths: Seq[StoragePath],
+                                       private val userSchema: Option[StructType],
+                                       private val prunedDataSchema: Option[StructType] = None)
+  extends BaseMergeOnReadSnapshotRelation(sqlContext, optParams, metaClient, globPaths, userSchema, prunedDataSchema) {
+
+  override type Relation = MergeOnReadSnapshotRelation
+
+  override def updatePrunedDataSchema(prunedSchema: StructType): Relation =
+    this.copy(prunedDataSchema = Some(prunedSchema))
+
+  override protected def shouldIncludeLogFiles(): Boolean = {
+    true
+  }
+
+}
+
+/**
+ * Base implementation of the Merge-on-Read snapshot relation
+ *
+ * NOTE: Reason this is extracted as a standalone base class is such that both MOR
+ *       Snapshot and Incremental relations could inherit from it while both being Scala
+ *       case classes
+ */
+abstract class BaseMergeOnReadSnapshotRelation(sqlContext: SQLContext,
+                                               optParams: Map[String, String],
+                                               metaClient: HoodieTableMetaClient,
+                                               globPaths: Seq[StoragePath],
+                                               userSchema: Option[StructType],
+                                               prunedDataSchema: Option[StructType])
+  extends HoodieBaseRelation(sqlContext, metaClient, optParams, userSchema, prunedDataSchema) {
 
   override type FileSplit = HoodieMergeOnReadFileSplit
 
-  private val mergeType = optParams.getOrElse(
-    DataSourceReadOptions.REALTIME_MERGE.key,
+  /**
+   * NOTE: These are the fields that are required to properly fulfil Merge-on-Read (MOR)
+   *       semantic:
+   *
+   *       <ol>
+   *         <li>Primary key is required to make sure we're able to correlate records from the base
+   *         file with the updated records from the delta-log file</li>
+   *         <li>Pre-combine key is required to properly perform the combining (or merging) of the
+   *         existing and updated records</li>
+   *       </ol>
+   *
+   *       However, in cases when merging is NOT performed (for ex, if file-group only contains base
+   *       files but no delta-log files, or if the query-type is equal to [["skip_merge"]]) neither
+   *       of primary-key or pre-combine-key are required to be fetched from storage (unless requested
+   *       by the query), therefore saving on throughput
+   */
+  protected lazy val mandatoryFieldsForMerging: Seq[String] =
+    Seq(recordKeyField) ++ preCombineFieldOpt.map(Seq(_)).getOrElse(Seq())
+
+  override lazy val mandatoryFields: Seq[String] = mandatoryFieldsForMerging
+
+  protected val mergeType: String = optParams.getOrElse(DataSourceReadOptions.REALTIME_MERGE.key,
     DataSourceReadOptions.REALTIME_MERGE.defaultValue)
 
-  private val maxCompactionMemoryInBytes = getMaxCompactionMemoryInBytes(jobConf)
+  /**
+   * Determines whether relation's schema could be pruned by Spark's Optimizer
+   */
+  override def canPruneRelationSchema: Boolean =
+    super.canPruneRelationSchema && isProjectionCompatible(tableState)
 
-  protected override def composeRDD(fileIndex: Seq[HoodieMergeOnReadFileSplit],
-                                    partitionSchema: StructType,
+  protected override def composeRDD(fileSplits: Seq[HoodieMergeOnReadFileSplit],
                                     tableSchema: HoodieTableSchema,
                                     requiredSchema: HoodieTableSchema,
-                                    filters: Array[Filter]): HoodieMergeOnReadRDD = {
-    val fullSchemaParquetReader = createBaseFileReader(
-      spark = sqlContext.sparkSession,
-      partitionSchema = partitionSchema,
-      tableSchema = tableSchema,
-      requiredSchema = tableSchema,
-      // This file-reader is used to read base file records, subsequently merging them with the records
-      // stored in delta-log files. As such, we have to read _all_ records from the base file, while avoiding
-      // applying any filtering _before_ we complete combining them w/ delta-log records (to make sure that
-      // we combine them correctly)
-      filters = Seq.empty,
-      options = optParams,
-      // NOTE: We have to fork the Hadoop Config here as Spark will be modifying it
-      //       to configure Parquet reader appropriately
-      hadoopConf = new Configuration(conf)
-    )
+                                    requestedColumns: Array[String],
+                                    filters: Array[Filter]): RDD[InternalRow] = {
+    val requiredFilters = Seq.empty
+    val optionalFilters = filters
+    val readers = createBaseFileReaders(tableSchema, requiredSchema, requestedColumns, requiredFilters, optionalFilters)
 
-    val requiredSchemaParquetReader = createBaseFileReader(
-      spark = sqlContext.sparkSession,
-      partitionSchema = partitionSchema,
+    new HoodieMergeOnReadRDDV2(
+      sqlContext.sparkContext,
+      config = jobConf,
+      fileReaders = readers,
       tableSchema = tableSchema,
       requiredSchema = requiredSchema,
-      filters = filters,
-      options = optParams,
-      // NOTE: We have to fork the Hadoop Config here as Spark will be modifying it
-      //       to configure Parquet reader appropriately
-      hadoopConf = new Configuration(conf)
-    )
-
-    val tableState = HoodieTableState(recordKeyField, preCombineFieldOpt)
-
-    new HoodieMergeOnReadRDD(sqlContext.sparkContext, jobConf, fullSchemaParquetReader,
-      requiredSchemaParquetReader, tableState, tableSchema, requiredSchema, fileIndex)
+      tableState = tableState,
+      mergeType = mergeType,
+      fileSplits = fileSplits)
   }
 
   protected override def collectFileSplits(partitionFilters: Seq[Expression], dataFilters: Seq[Expression]): List[HoodieMergeOnReadFileSplit] = {
@@ -104,68 +128,51 @@ class MergeOnReadSnapshotRelation(sqlContext: SQLContext,
       HoodieFileIndex.convertFilterForTimestampKeyGenerator(metaClient, partitionFilters)
 
     if (globPaths.isEmpty) {
-      val fileSlices = fileIndex.listFileSlices(convertedPartitionFilters)
-      buildSplits(fileSlices.values.flatten.toSeq)
+      val fileSlices = fileIndex.filterFileSlices(dataFilters, convertedPartitionFilters).flatMap(s => s._2)
+      buildSplits(fileSlices)
     } else {
-      // TODO refactor to avoid iterating over listed files multiple times
-      val partitions = listLatestBaseFiles(globPaths, convertedPartitionFilters, dataFilters)
-      val partitionPaths = partitions.keys.toSeq
-      if (partitionPaths.isEmpty || latestInstant.isEmpty) {
-        // If this an empty table OR it has no completed commits yet, return
-        List.empty[HoodieMergeOnReadFileSplit]
-      } else {
-        val fileSlices = listFileSlices(partitionPaths)
-        buildSplits(fileSlices)
-      }
+      val fileSlices = listLatestFileSlices(globPaths, partitionFilters, dataFilters)
+      buildSplits(fileSlices)
     }
   }
 
   protected def buildSplits(fileSlices: Seq[FileSlice]): List[HoodieMergeOnReadFileSplit] = {
     fileSlices.map { fileSlice =>
       val baseFile = toScalaOption(fileSlice.getBaseFile)
-      val logFiles = Option(fileSlice.getLogFiles.sorted(HoodieLogFile.getLogFileComparator).iterator().asScala.toList)
+      val logFiles = fileSlice.getLogFiles.sorted(HoodieLogFile.getLogFileComparator).iterator().asScala.toList
 
       val partitionedBaseFile = baseFile.map { file =>
-        val filePath = getFilePath(file.getFileStatus.getPath)
-        PartitionedFile(InternalRow.empty, filePath, 0, file.getFileLen)
+        createPartitionedFile(
+          getPartitionColumnsAsInternalRow(file.getPathInfo), file.getPathInfo.getPath, 0, file.getFileLen)
       }
 
-      HoodieMergeOnReadFileSplit(partitionedBaseFile, logFiles, queryTimestamp.get,
-        metaClient.getBasePath, maxCompactionMemoryInBytes, mergeType)
+      HoodieMergeOnReadFileSplit(partitionedBaseFile, logFiles)
     }.toList
-  }
-
-  private def listFileSlices(partitionPaths: Seq[Path]): Seq[FileSlice] = {
-    // NOTE: It's critical for us to re-use [[InMemoryFileIndex]] to make sure we're leveraging
-    //       [[FileStatusCache]] and avoid listing the whole table again
-    val inMemoryFileIndex = HoodieInMemoryFileIndex.create(sparkSession, partitionPaths)
-    val fsView = new HoodieTableFileSystemView(metaClient, timeline, inMemoryFileIndex.allFiles.toArray)
-
-    val queryTimestamp = this.queryTimestamp.get
-
-    partitionPaths.flatMap { partitionPath =>
-      val relativePath = getRelativePartitionPath(new Path(basePath), partitionPath)
-      fsView.getLatestMergedFileSlicesBeforeOrOn(relativePath, queryTimestamp).iterator().asScala.toSeq
-    }
   }
 }
 
-object MergeOnReadSnapshotRelation {
+object MergeOnReadSnapshotRelation extends SparkAdapterSupport {
 
-  def getFilePath(path: Path): String = {
-    // Here we use the Path#toUri to encode the path string, as there is a decode in
-    // ParquetFileFormat#buildReaderWithPartitionValues in the spark project when read the table
-    // .So we should encode the file path here. Otherwise, there is a FileNotException throw
-    // out.
-    // For example, If the "pt" is the partition path field, and "pt" = "2021/02/02", If
-    // we enable the URL_ENCODE_PARTITIONING and write data to hudi table.The data path
-    // in the table will just like "/basePath/2021%2F02%2F02/xxxx.parquet". When we read
-    // data from the table, if there are no encode for the file path,
-    // ParquetFileFormat#buildReaderWithPartitionValues will decode it to
-    // "/basePath/2021/02/02/xxxx.parquet" witch will result to a FileNotException.
-    // See FileSourceScanExec#createBucketedReadRDD in spark project which do the same thing
-    // when create PartitionedFile.
-    path.toUri.toString
+  /**
+   * List of [[HoodieRecordPayload]] classes capable of merging projected records:
+   * in some cases, when for example, user is only interested in a handful of columns rather
+   * than the full row we will be able to optimize data throughput by only fetching the required
+   * columns. However, to properly fulfil MOR semantic particular [[HoodieRecordPayload]] in
+   * question should be able to merge records based on just such projected representation (including
+   * columns required for merging, such as primary-key, pre-combine key, etc)
+   */
+  private val projectionCompatiblePayloadClasses: Set[String] = Seq(
+    classOf[OverwriteWithLatestAvroPayload]
+  ).map(_.getName).toSet
+
+  def isProjectionCompatible(tableState: HoodieTableState): Boolean =
+    projectionCompatiblePayloadClasses.contains(tableState.recordPayloadClassName)
+
+  def createPartitionedFile(partitionValues: InternalRow,
+                            filePath: StoragePath,
+                            start: Long,
+                            length: Long): PartitionedFile = {
+    sparkAdapter.getSparkPartitionedFileUtils.createPartitionedFile(
+      partitionValues, filePath, start, length)
   }
-
 }

@@ -21,6 +21,7 @@ package org.apache.hudi.table.action.commit;
 import org.apache.hudi.avro.HoodieAvroUtils;
 import org.apache.hudi.avro.model.HoodieClusteringGroup;
 import org.apache.hudi.avro.model.HoodieClusteringPlan;
+import org.apache.hudi.client.HoodieColumnStatsIndexUtils;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.client.transaction.TransactionManager;
 import org.apache.hudi.client.utils.TransactionUtils;
@@ -31,18 +32,20 @@ import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieFileGroupId;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
-import org.apache.hudi.common.model.HoodieRecordPayload;
 import org.apache.hudi.common.model.HoodieWriteStat;
 import org.apache.hudi.common.model.WriteOperationType;
+import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieInstant.State;
-import org.apache.hudi.common.table.timeline.HoodieTimeline;
+import org.apache.hudi.common.table.timeline.InstantGenerator;
 import org.apache.hudi.common.util.ClusteringUtils;
 import org.apache.hudi.common.util.CommitUtils;
+import org.apache.hudi.common.util.Functions;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ReflectionUtils;
 import org.apache.hudi.common.util.StringUtils;
+import org.apache.hudi.common.util.ValidationUtils;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieClusteringException;
@@ -56,13 +59,13 @@ import org.apache.hudi.table.action.HoodieWriteMetadata;
 import org.apache.hudi.table.action.cluster.strategy.ClusteringExecutionStrategy;
 
 import org.apache.avro.Schema;
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -70,16 +73,20 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-public abstract class BaseCommitActionExecutor<T extends HoodieRecordPayload, I, K, O, R>
+import static org.apache.hudi.common.table.timeline.TimelineMetadataUtils.serializeCommitMetadata;
+import static org.apache.hudi.config.HoodieWriteConfig.WRITE_STATUS_STORAGE_LEVEL_VALUE;
+
+public abstract class BaseCommitActionExecutor<T, I, K, O, R>
     extends BaseActionExecutor<T, I, K, O, R> {
 
-  private static final Logger LOG = LogManager.getLogger(BaseCommitActionExecutor.class);
+  private static final Logger LOG = LoggerFactory.getLogger(BaseCommitActionExecutor.class);
 
   protected final Option<Map<String, String>> extraMetadata;
   protected final WriteOperationType operationType;
   protected final TaskContextSupplier taskContextSupplier;
-  protected final TransactionManager txnManager;
-  protected Option<Pair<HoodieInstant, Map<String, String>>> lastCompletedTxn;
+  protected final Option<TransactionManager> txnManagerOption;
+  protected final Option<Pair<HoodieInstant, Map<String, String>>> lastCompletedTxn;
+  protected final Set<String> pendingInflightAndRequestedInstants;
 
   public BaseCommitActionExecutor(HoodieEngineContext context, HoodieWriteConfig config,
                                   HoodieTable<T, I, K, O> table, String instantTime, WriteOperationType operationType,
@@ -89,9 +96,18 @@ public abstract class BaseCommitActionExecutor<T extends HoodieRecordPayload, I,
     this.extraMetadata = extraMetadata;
     this.taskContextSupplier = context.getTaskContextSupplier();
     // TODO : Remove this once we refactor and move out autoCommit method from here, since the TxnManager is held in {@link BaseHoodieWriteClient}.
-    this.txnManager = new TransactionManager(config, table.getMetaClient().getFs());
-    this.lastCompletedTxn = TransactionUtils.getLastCompletedTxnInstantAndMetadata(table.getMetaClient());
-    if (table.getStorageLayout().doesNotSupport(operationType)) {
+    this.txnManagerOption = config.shouldAutoCommit()
+        ? Option.of(new TransactionManager(config, table.getStorage())) : Option.empty();
+    if (this.txnManagerOption.isPresent() && this.txnManagerOption.get().isLockRequired()) {
+      // these txn metadata are only needed for auto commit when optimistic concurrent control is also enabled
+      this.lastCompletedTxn = TransactionUtils.getLastCompletedTxnInstantAndMetadata(table.getMetaClient());
+      this.pendingInflightAndRequestedInstants = TransactionUtils.getInflightAndRequestedInstants(table.getMetaClient());
+      this.pendingInflightAndRequestedInstants.remove(instantTime);
+    } else {
+      this.lastCompletedTxn = Option.empty();
+      this.pendingInflightAndRequestedInstants = Collections.emptySet();
+    }
+    if (!table.getStorageLayout().writeOperationSupported(operationType)) {
       throw new UnsupportedOperationException("Executor " + this.getClass().getSimpleName()
           + " is not compatible with table layout " + table.getStorageLayout().getClass().getSimpleName());
     }
@@ -140,9 +156,10 @@ public abstract class BaseCommitActionExecutor<T extends HoodieRecordPayload, I,
 
       HoodieActiveTimeline activeTimeline = table.getActiveTimeline();
       String commitActionType = getCommitActionType();
-      HoodieInstant requested = new HoodieInstant(State.REQUESTED, commitActionType, instantTime);
-      activeTimeline.transitionRequestedToInflight(requested,
-          Option.of(metadata.toJsonString().getBytes(StandardCharsets.UTF_8)),
+      HoodieInstant requested = table.getMetaClient().createNewInstant(State.REQUESTED, commitActionType, instantTime);
+      activeTimeline.transitionRequestedToInflight(
+          requested,
+          serializeCommitMetadata(table.getMetaClient().getCommitMetadataSerDe(), metadata),
           config.shouldAllowMultiWriteOnSameInstant());
     } catch (IOException io) {
       throw new HoodieCommitException("Failed to commit " + instantTime + " unable to save inflight metadata ", io);
@@ -150,9 +167,8 @@ public abstract class BaseCommitActionExecutor<T extends HoodieRecordPayload, I,
   }
 
   protected String getCommitActionType() {
-    return  table.getMetaClient().getCommitActionType();
+    return table.getMetaClient().getCommitActionType();
   }
-
 
   /**
    * Check if any validators are configured and run those validations. If any of the validations fail, throws HoodieValidationException.
@@ -163,44 +179,85 @@ public abstract class BaseCommitActionExecutor<T extends HoodieRecordPayload, I,
     }
     throw new HoodieIOException("Precommit validation not implemented for all engines yet");
   }
-  
+
   protected void commitOnAutoCommit(HoodieWriteMetadata result) {
     // validate commit action before committing result
     runPrecommitValidators(result);
     if (config.shouldAutoCommit()) {
       LOG.info("Auto commit enabled: Committing " + instantTime);
-      autoCommit(extraMetadata, result);
+      autoCommit(result);
     } else {
       LOG.info("Auto commit disabled for " + instantTime);
     }
   }
 
-  protected void autoCommit(Option<Map<String, String>> extraMetadata, HoodieWriteMetadata<O> result) {
-    final Option<HoodieInstant> inflightInstant = Option.of(new HoodieInstant(State.INFLIGHT,
+  protected void autoCommit(HoodieWriteMetadata<O> result) {
+    InstantGenerator factory = table.getMetaClient().getInstantGenerator();
+    final Option<HoodieInstant> inflightInstant = Option.of(factory.createNewInstant(State.INFLIGHT,
         getCommitActionType(), instantTime));
-    this.txnManager.beginTransaction(inflightInstant,
+    ValidationUtils.checkState(this.txnManagerOption.isPresent(), "The transaction manager has not been initialized");
+    TransactionManager txnManager = this.txnManagerOption.get();
+    txnManager.beginTransaction(inflightInstant,
         lastCompletedTxn.isPresent() ? Option.of(lastCompletedTxn.get().getLeft()) : Option.empty());
     try {
       setCommitMetadata(result);
-      // reload active timeline so as to get all updates after current transaction have started. hence setting last arg to true.
-      TransactionUtils.resolveWriteConflictIfAny(table, this.txnManager.getCurrentTransactionOwner(),
-          result.getCommitMetadata(), config, this.txnManager.getLastCompletedTransactionOwner(), true);
-      commit(extraMetadata, result);
+      // table instance is created outside the transaction boundary so setting `timelineRefreshedWithinTransaction` to false below
+      TransactionUtils.resolveWriteConflictIfAny(table, txnManager.getCurrentTransactionOwner(),
+          result.getCommitMetadata(), config, txnManager.getLastCompletedTransactionOwner(), false, pendingInflightAndRequestedInstants);
+      commit(result);
     } finally {
-      this.txnManager.endTransaction(inflightInstant);
+      txnManager.endTransaction(inflightInstant);
     }
   }
 
   protected abstract void setCommitMetadata(HoodieWriteMetadata<O> result);
 
-  protected abstract void commit(Option<Map<String, String>> extraMetadata, HoodieWriteMetadata<O> result);
+  protected abstract void commit(HoodieWriteMetadata<O> result);
+
+  protected void commit(HoodieWriteMetadata<O> result, List<HoodieWriteStat> writeStats) {
+    String actionType = getCommitActionType();
+    LOG.info("Committing " + instantTime + ", action Type " + actionType + ", operation Type " + operationType);
+    result.setCommitted(true);
+    result.setWriteStats(writeStats);
+    // Finalize write
+    finalizeWrite(instantTime, writeStats, result);
+    try {
+      HoodieActiveTimeline activeTimeline = table.getActiveTimeline();
+      HoodieCommitMetadata metadata = result.getCommitMetadata().get();
+
+      writeTableMetadata(metadata, actionType);
+      // cannot serialize maps with null values
+      metadata.getExtraMetadata().entrySet().removeIf(entry -> entry.getValue() == null);
+      activeTimeline.saveAsComplete(false,
+          table.getMetaClient().createNewInstant(State.INFLIGHT, actionType, instantTime),
+          serializeCommitMetadata(table.getMetaClient().getCommitMetadataSerDe(), metadata));
+      LOG.info("Committed " + instantTime);
+      result.setCommitMetadata(Option.of(metadata));
+      // update cols to Index as applicable
+      HoodieColumnStatsIndexUtils.updateColsToIndex(table, config, metadata,
+          (Functions.Function2<HoodieTableMetaClient, List<String>, Void>) (metaClient, columnsToIndex) -> {
+            updateColumnsToIndexForColumnStats(metaClient, columnsToIndex);
+            return null;
+          });
+    } catch (IOException e) {
+      throw new HoodieCommitException("Failed to complete commit " + config.getBasePath() + " at time " + instantTime,
+          e);
+    }
+  }
+
+  /**
+   * Updates the list of columns indexed with col stats index in Metadata table.
+   * @param metaClient instance of {@link HoodieTableMetaClient} of interest.
+   * @param columnsToIndex list of columns to index.
+   */
+  protected abstract void updateColumnsToIndexForColumnStats(HoodieTableMetaClient metaClient, List<String> columnsToIndex);
 
   /**
    * Finalize Write operation.
    * @param instantTime Instant Time
    * @param stats Hoodie Write Stat
    */
-  protected void finalizeWrite(String instantTime, List<HoodieWriteStat> stats, HoodieWriteMetadata result) {
+  protected void finalizeWrite(String instantTime, List<HoodieWriteStat> stats, HoodieWriteMetadata<O> result) {
     try {
       Instant start = Instant.now();
       table.finalizeWrite(context, instantTime, stats);
@@ -217,21 +274,22 @@ public abstract class BaseCommitActionExecutor<T extends HoodieRecordPayload, I,
     return config.getSchema();
   }
 
-  protected boolean isWorkloadProfileNeeded() {
-    return true;
-  }
-
   protected abstract Iterator<List<WriteStatus>> handleInsert(String idPfx,
-      Iterator<HoodieRecord<T>> recordItr) throws Exception;
+                                                              Iterator<HoodieRecord<T>> recordItr) throws Exception;
 
   protected abstract Iterator<List<WriteStatus>> handleUpdate(String partitionPath, String fileId,
-      Iterator<HoodieRecord<T>> recordItr) throws IOException;
+                                                              Iterator<HoodieRecord<T>> recordItr) throws IOException;
 
   protected HoodieWriteMetadata<HoodieData<WriteStatus>> executeClustering(HoodieClusteringPlan clusteringPlan) {
-    HoodieInstant instant = HoodieTimeline.getReplaceCommitRequestedInstant(instantTime);
+    context.setJobStatus(this.getClass().getSimpleName(), "Clustering records for " + config.getTableName());
+    HoodieInstant instant = ClusteringUtils.getRequestedClusteringInstant(instantTime, table.getActiveTimeline(),
+        table.getMetaClient().getInstantGenerator()).get();
     // Mark instant as clustering inflight
-    table.getActiveTimeline().transitionReplaceRequestedToInflight(instant, Option.empty());
+    ClusteringUtils.transitionClusteringOrReplaceRequestedToInflight(instant, Option.empty(), table.getActiveTimeline());
     table.getMetaClient().reloadActiveTimeline();
+
+    // Disable auto commit. Strategy is only expected to write data in new files.
+    config.setValue(HoodieWriteConfig.AUTO_COMMIT_ENABLE, Boolean.FALSE.toString());
 
     final Schema schema = HoodieAvroUtils.addMetadataFields(new Schema.Parser().parse(config.getSchema()));
     HoodieWriteMetadata<HoodieData<WriteStatus>> writeMetadata = (
@@ -241,11 +299,13 @@ public abstract class BaseCommitActionExecutor<T extends HoodieRecordPayload, I,
         .performClustering(clusteringPlan, schema, instantTime);
     HoodieData<WriteStatus> writeStatusList = writeMetadata.getWriteStatuses();
     HoodieData<WriteStatus> statuses = updateIndex(writeStatusList, writeMetadata);
+    statuses.persist(config.getString(WRITE_STATUS_STORAGE_LEVEL_VALUE), context, HoodieData.HoodieDataCacheKey.of(config.getBasePath(), instantTime));
+    // triggers clustering.
     writeMetadata.setWriteStats(statuses.map(WriteStatus::getStat).collectAsList());
     writeMetadata.setPartitionToReplaceFileIds(getPartitionToReplacedFileIds(clusteringPlan, writeMetadata));
-    validateWriteResult(clusteringPlan, writeMetadata);
     commitOnAutoCommit(writeMetadata);
     if (!writeMetadata.getCommitMetadata().isPresent()) {
+      LOG.info("Found empty commit metadata for clustering with instant time " + instantTime);
       HoodieCommitMetadata commitMetadata = CommitUtils.buildMetadata(writeMetadata.getWriteStats().get(), writeMetadata.getPartitionToReplaceFileIds(),
           extraMetadata, operationType, getSchemaToStoreInCommit(), getCommitActionType());
       writeMetadata.setCommitMetadata(Option.of(commitMetadata));
@@ -256,7 +316,7 @@ public abstract class BaseCommitActionExecutor<T extends HoodieRecordPayload, I,
   private HoodieData<WriteStatus> updateIndex(HoodieData<WriteStatus> writeStatuses, HoodieWriteMetadata<HoodieData<WriteStatus>> result) {
     Instant indexStartTime = Instant.now();
     // Update the index back
-    HoodieData<WriteStatus> statuses = table.getIndex().updateLocation(writeStatuses, context, table);
+    HoodieData<WriteStatus> statuses = table.getIndex().updateLocation(writeStatuses, context, table, instantTime);
     result.setIndexUpdateDuration(Duration.between(indexStartTime, Instant.now()));
     result.setWriteStatuses(statuses);
     return statuses;
@@ -286,5 +346,4 @@ public abstract class BaseCommitActionExecutor<T extends HoodieRecordPayload, I,
           + " write statuses");
     }
   }
-
 }

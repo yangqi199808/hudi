@@ -21,40 +21,54 @@ package org.apache.hudi.index.bucket;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.keygen.KeyGenUtils;
 
+import java.io.Serializable;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
-public class BucketIdentifier {
-  // compatible with the spark bucket name
+public class BucketIdentifier implements Serializable {
+  // Compatible with the spark bucket name
   private static final Pattern BUCKET_NAME = Pattern.compile(".*_(\\d+)(?:\\..*)?$");
+
+  // Ensure the same records keys from different writers are desired to be distributed into the same bucket
+  private static final String CONSTANT_FILE_ID_SUFFIX = "-0000-0000-0000-000000000000";
 
   public static int getBucketId(HoodieRecord record, String indexKeyFields, int numBuckets) {
     return getBucketId(record.getKey(), indexKeyFields, numBuckets);
   }
 
   public static int getBucketId(HoodieKey hoodieKey, String indexKeyFields, int numBuckets) {
-    List<String> hashKeyFields;
-    if (!hoodieKey.getRecordKey().contains(":")) {
-      hashKeyFields = Collections.singletonList(hoodieKey.getRecordKey());
-    } else {
-      Map<String, String> recordKeyPairs = Arrays.stream(hoodieKey.getRecordKey().split(","))
-          .map(p -> p.split(":"))
-          .collect(Collectors.toMap(p -> p[0], p -> p[1]));
-      hashKeyFields = Arrays.stream(indexKeyFields.split(","))
-          .map(f -> recordKeyPairs.get(f))
-          .collect(Collectors.toList());
-    }
+    return getBucketId(getHashKeys(hoodieKey, indexKeyFields), numBuckets);
+  }
+
+  public static int getBucketId(HoodieKey hoodieKey, List<String> indexKeyFields, int numBuckets) {
+    return getBucketId(getHashKeys(hoodieKey.getRecordKey(), indexKeyFields), numBuckets);
+  }
+
+  public static int getBucketId(String recordKey, String indexKeyFields, int numBuckets) {
+    return getBucketId(getHashKeys(recordKey, indexKeyFields), numBuckets);
+  }
+
+  public static int getBucketId(List<String> hashKeyFields, int numBuckets) {
     return (hashKeyFields.hashCode() & Integer.MAX_VALUE) % numBuckets;
   }
 
-  // only for test
-  public  static int getBucketId(List<String> hashKeyFields, int numBuckets) {
-    return hashKeyFields.hashCode() % numBuckets;
+  public static List<String> getHashKeys(HoodieKey hoodieKey, String indexKeyFields) {
+    return getHashKeys(hoodieKey.getRecordKey(), indexKeyFields);
+  }
+
+  protected static List<String> getHashKeys(String recordKey, String indexKeyFields) {
+    return getHashKeysUsingIndexFields(recordKey, Arrays.asList(indexKeyFields.split(",")));
+  }
+
+  protected static List<String> getHashKeys(String recordKey, List<String> indexKeyFields) {
+    return getHashKeysUsingIndexFields(recordKey, indexKeyFields);
+  }
+
+  private static List<String> getHashKeysUsingIndexFields(String recordKey, List<String> indexKeyFields) {
+    return Arrays.asList(KeyGenUtils.extractRecordKeysByFields(recordKey, indexKeyFields));
   }
 
   public static String partitionBucketIdStr(String partition, int bucketId) {
@@ -62,19 +76,43 @@ public class BucketIdentifier {
   }
 
   public static int bucketIdFromFileId(String fileId) {
-    return Integer.parseInt(fileId.substring(0, 8));
+    return Integer.parseInt(bucketIdStrFromFileId(fileId));
+  }
+
+  public static String bucketIdStrFromFileId(String fileId) {
+    return fileId.substring(0, 8);
   }
 
   public static String bucketIdStr(int n) {
     return String.format("%08d", n);
   }
 
+  public static String newBucketFileIdPrefix(int bucketId, boolean fixed) {
+    return fixed ? newBucketFileIdFixedSuffix(bucketId) : newBucketFileIdPrefix(bucketId);
+  }
+
+  public static String newBucketFileIdPrefix(String bucketId, boolean fixed) {
+    return fixed ? newBucketFileIdFixedSuffix(bucketId) : newBucketFileIdPrefix(bucketId);
+  }
+
   public static String newBucketFileIdPrefix(int bucketId) {
     return newBucketFileIdPrefix(bucketIdStr(bucketId));
   }
 
+  public static String newBucketFileIdPrefix(String fileId, int bucketId) {
+    return fileId.replaceFirst(".{8}", bucketIdStr(bucketId));
+  }
+
   public static String newBucketFileIdPrefix(String bucketId) {
     return FSUtils.createNewFileIdPfx().replaceFirst(".{8}", bucketId);
+  }
+
+  private static String newBucketFileIdFixedSuffix(String bucketId) {
+    return bucketId + CONSTANT_FILE_ID_SUFFIX;
+  }
+
+  private static String newBucketFileIdFixedSuffix(int bucketId) {
+    return newBucketFileIdFixedSuffix(bucketIdStr(bucketId));
   }
 
   public static boolean isBucketFileName(String name) {

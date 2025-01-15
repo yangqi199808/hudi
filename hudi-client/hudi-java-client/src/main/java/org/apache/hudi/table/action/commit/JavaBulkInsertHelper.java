@@ -19,9 +19,9 @@
 package org.apache.hudi.table.action.commit;
 
 import org.apache.hudi.client.WriteStatus;
+import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieRecord;
-import org.apache.hudi.common.model.HoodieRecordPayload;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ReflectionUtils;
@@ -30,6 +30,7 @@ import org.apache.hudi.execution.JavaLazyInsertIterable;
 import org.apache.hudi.execution.bulkinsert.JavaBulkInsertInternalPartitionerFactory;
 import org.apache.hudi.io.CreateHandleFactory;
 import org.apache.hudi.io.WriteHandleFactory;
+import org.apache.hudi.metadata.JavaHoodieMetadataBulkInsertPartitioner;
 import org.apache.hudi.table.BulkInsertPartitioner;
 import org.apache.hudi.table.FileIdPrefixProvider;
 import org.apache.hudi.table.HoodieTable;
@@ -44,10 +45,11 @@ import java.util.List;
  * @param <T>
  */
 @SuppressWarnings("checkstyle:LineLength")
-public class JavaBulkInsertHelper<T extends HoodieRecordPayload, R> extends BaseBulkInsertHelper<T, List<HoodieRecord<T>>,
+public class JavaBulkInsertHelper<T, R> extends BaseBulkInsertHelper<T, List<HoodieRecord<T>>,
     List<HoodieKey>, List<WriteStatus>, R> {
 
   private JavaBulkInsertHelper() {
+    super(ignored -> -1);
   }
 
   private static class BulkInsertHelperHolder {
@@ -71,13 +73,16 @@ public class JavaBulkInsertHelper<T extends HoodieRecordPayload, R> extends Base
     // It's possible the transition to inflight could have already happened.
     if (!table.getActiveTimeline().filterInflights().containsInstant(instantTime)) {
       table.getActiveTimeline().transitionRequestedToInflight(
-          new HoodieInstant(HoodieInstant.State.REQUESTED, table.getMetaClient().getCommitActionType(), instantTime),
+          table.getInstantGenerator().createNewInstant(HoodieInstant.State.REQUESTED, table.getMetaClient().getCommitActionType(), instantTime),
           Option.empty(),
           config.shouldAllowMultiWriteOnSameInstant());
     }
 
+    BulkInsertPartitioner partitioner = userDefinedBulkInsertPartitioner.orElseGet(() -> JavaBulkInsertInternalPartitionerFactory.get(config.getBulkInsertSortMode()));
+
     // write new files
-    List<WriteStatus> writeStatuses = bulkInsert(inputRecords, instantTime, table, config, performDedupe, userDefinedBulkInsertPartitioner, false, config.getBulkInsertShuffleParallelism(), new CreateHandleFactory(false));
+    List<WriteStatus> writeStatuses = bulkInsert(inputRecords, instantTime, table, config, performDedupe, partitioner, false,
+        config.getBulkInsertShuffleParallelism(), new CreateHandleFactory(false));
     //update index
     ((BaseJavaCommitActionExecutor) executor).updateIndexAndCommitIfNeeded(writeStatuses, result);
     return result;
@@ -89,36 +94,41 @@ public class JavaBulkInsertHelper<T extends HoodieRecordPayload, R> extends Base
                                       HoodieTable<T, List<HoodieRecord<T>>, List<HoodieKey>, List<WriteStatus>> table,
                                       HoodieWriteConfig config,
                                       boolean performDedupe,
-                                      Option<BulkInsertPartitioner> userDefinedBulkInsertPartitioner,
+                                      BulkInsertPartitioner partitioner,
                                       boolean useWriterSchema,
-                                      int parallelism,
+                                      int configuredParallelism,
                                       WriteHandleFactory writeHandleFactory) {
 
     // De-dupe/merge if needed
     List<HoodieRecord<T>> dedupedRecords = inputRecords;
 
+    int targetParallelism = deduceShuffleParallelism(inputRecords, configuredParallelism);
+
     if (performDedupe) {
-      dedupedRecords = (List<HoodieRecord<T>>) JavaWriteHelper.newInstance().combineOnCondition(config.shouldCombineBeforeInsert(), inputRecords,
-          parallelism, table);
+      dedupedRecords = (List<HoodieRecord<T>>) JavaWriteHelper.newInstance()
+          .combineOnCondition(config.shouldCombineBeforeInsert(), inputRecords, targetParallelism, table);
     }
 
-    final List<HoodieRecord<T>> repartitionedRecords;
-    BulkInsertPartitioner partitioner = userDefinedBulkInsertPartitioner.isPresent()
-        ? userDefinedBulkInsertPartitioner.get()
-        : JavaBulkInsertInternalPartitionerFactory.get(config.getBulkInsertSortMode());
-    // only List is supported for Java partitioner, but it is not enforced by BulkInsertPartitioner API. To improve this, TODO HUDI-3463
-    repartitionedRecords = (List<HoodieRecord<T>>) partitioner.repartitionRecords(dedupedRecords, parallelism);
+    final List<HoodieRecord<T>> repartitionedRecords =
+        (List<HoodieRecord<T>>) partitioner.repartitionRecords(dedupedRecords, targetParallelism);
 
-    FileIdPrefixProvider fileIdPrefixProvider = (FileIdPrefixProvider) ReflectionUtils.loadClass(
-        config.getFileIdPrefixProviderClassName(),
-        config.getProps());
+    String fileIdPrefix;
+    if (partitioner instanceof JavaHoodieMetadataBulkInsertPartitioner) {
+      fileIdPrefix = partitioner.getFileIdPfx(0);
+    } else {
+      FileIdPrefixProvider fileIdPrefixProvider = (FileIdPrefixProvider) ReflectionUtils.loadClass(
+          config.getFileIdPrefixProviderClassName(),
+          new TypedProperties(config.getProps()));
+      fileIdPrefix = fileIdPrefixProvider.createFilePrefix("");
+    }
 
     List<WriteStatus> writeStatuses = new ArrayList<>();
 
     new JavaLazyInsertIterable<>(repartitionedRecords.iterator(), true,
         config, instantTime, table,
-        fileIdPrefixProvider.createFilePrefix(""), table.getTaskContextSupplier(),
-        new CreateHandleFactory<>()).forEachRemaining(writeStatuses::addAll);
+        fileIdPrefix, table.getTaskContextSupplier(),
+        // Always get the first WriteHandleFactory, as there is only a single data partition for hudi java engine.
+        (WriteHandleFactory) partitioner.getWriteHandleFactory(0).orElse(writeHandleFactory)).forEachRemaining(writeStatuses::addAll);
 
     return writeStatuses;
   }

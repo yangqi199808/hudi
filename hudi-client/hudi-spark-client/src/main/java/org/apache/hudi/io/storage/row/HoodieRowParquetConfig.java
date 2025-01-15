@@ -18,7 +18,8 @@
 
 package org.apache.hudi.io.storage.row;
 
-import org.apache.hudi.io.storage.HoodieBaseParquetConfig;
+import org.apache.hudi.io.storage.HoodieParquetConfig;
+import org.apache.hudi.storage.hadoop.HadoopStorageConfiguration;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
@@ -26,11 +27,16 @@ import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 /**
  * ParquetConfig for datasource implementation with {@link org.apache.hudi.client.model.HoodieInternalRow}.
  */
-public class HoodieRowParquetConfig extends HoodieBaseParquetConfig<HoodieRowParquetWriteSupport> {
+public class HoodieRowParquetConfig extends HoodieParquetConfig<HoodieRowParquetWriteSupport> {
 
   public HoodieRowParquetConfig(HoodieRowParquetWriteSupport writeSupport, CompressionCodecName compressionCodecName,
-                                int blockSize, int pageSize, long maxFileSize, Configuration hadoopConf,
-                                double compressionRatio) {
-    super(writeSupport, compressionCodecName, blockSize, pageSize, maxFileSize, hadoopConf, compressionRatio);
+      int blockSize, int pageSize, long maxFileSize, Configuration hadoopConf,
+      double compressionRatio, boolean enableDictionary) {
+    super(writeSupport, compressionCodecName, blockSize, pageSize, maxFileSize,
+        new HadoopStorageConfiguration(hadoopConf), compressionRatio, enableDictionary);
+  }
+
+  public Configuration getHadoopConf() {
+    return getStorageConf().unwrapAs(Configuration.class);
   }
 }

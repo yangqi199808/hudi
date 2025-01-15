@@ -28,6 +28,7 @@ import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.ArrayType;
 import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.IntType;
+import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.LogicalTypeFamily;
 import org.apache.flink.table.types.logical.MapType;
@@ -36,9 +37,9 @@ import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.TimeType;
 import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.TypeInformationRawType;
-import org.apache.flink.table.types.logical.utils.LogicalTypeChecks;
 
 import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * Converts an Avro schema into Flink's type information. It uses {@link org.apache.flink.api.java.typeutils.RowTypeInfo} for
@@ -71,6 +72,8 @@ public class AvroSchemaConverter {
         }
         return DataTypes.ROW(fields).notNull();
       case ENUM:
+      case STRING:
+        // convert Avro's Utf8/CharSequence to String
         return DataTypes.STRING().notNull();
       case ARRAY:
         return DataTypes.ARRAY(convertToDataType(schema.getElementType())).notNull();
@@ -94,9 +97,24 @@ public class AvroSchemaConverter {
           actualSchema = schema.getTypes().get(0);
           nullable = false;
         } else {
+          List<Schema> nonNullTypes = schema.getTypes().stream()
+              .filter(s -> s.getType() != Schema.Type.NULL)
+              .collect(Collectors.toList());
+          nullable = schema.getTypes().size() > nonNullTypes.size();
+
           // use Kryo for serialization
-          return new AtomicDataType(
-              new TypeInformationRawType<>(false, Types.GENERIC(Object.class)));
+          DataType rawDataType = new AtomicDataType(
+              new TypeInformationRawType<>(false, Types.GENERIC(Object.class)))
+              .notNull();
+
+          if (recordTypesOfSameNumFields(nonNullTypes)) {
+            DataType converted = DataTypes.ROW(
+                    DataTypes.FIELD("wrapper", rawDataType))
+                .notNull();
+            return nullable ? converted.nullable() : converted;
+          }
+          // use Kryo for serialization
+          return nullable ? rawDataType.nullable() : rawDataType;
         }
         DataType converted = convertToDataType(actualSchema);
         return nullable ? converted.nullable() : converted;
@@ -110,9 +128,6 @@ public class AvroSchemaConverter {
         }
         // convert fixed size binary data to primitive byte arrays
         return DataTypes.VARBINARY(schema.getFixedSize()).notNull();
-      case STRING:
-        // convert Avro's Utf8/CharSequence to String
-        return DataTypes.STRING().notNull();
       case BYTES:
         // logical decimal type
         if (schema.getLogicalType() instanceof LogicalTypes.Decimal) {
@@ -135,8 +150,12 @@ public class AvroSchemaConverter {
         // logical timestamp type
         if (schema.getLogicalType() == LogicalTypes.timestampMillis()) {
           return DataTypes.TIMESTAMP(3).notNull();
+        } else if (schema.getLogicalType() == LogicalTypes.localTimestampMillis()) {
+          return DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(3).notNull();
         } else if (schema.getLogicalType() == LogicalTypes.timestampMicros()) {
           return DataTypes.TIMESTAMP(6).notNull();
+        } else if (schema.getLogicalType() == LogicalTypes.localTimestampMicros()) {
+          return DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6).notNull();
         } else if (schema.getLogicalType() == LogicalTypes.timeMillis()) {
           return DataTypes.TIME(3).notNull();
         } else if (schema.getLogicalType() == LogicalTypes.timeMicros()) {
@@ -157,6 +176,20 @@ public class AvroSchemaConverter {
   }
 
   /**
+   * Returns true if all the types are RECORD type with same number of fields.
+   */
+  private static boolean recordTypesOfSameNumFields(List<Schema> types) {
+    if (types == null || types.size() == 0) {
+      return false;
+    }
+    if (types.stream().anyMatch(s -> s.getType() != Schema.Type.RECORD)) {
+      return false;
+    }
+    int numFields = types.get(0).getFields().size();
+    return types.stream().allMatch(s -> s.getFields().size() == numFields);
+  }
+
+  /**
    * Converts Flink SQL {@link LogicalType} (can be nested) into an Avro schema.
    *
    * <p>Use "record" as the type name.
@@ -172,7 +205,7 @@ public class AvroSchemaConverter {
   /**
    * Converts Flink SQL {@link LogicalType} (can be nested) into an Avro schema.
    *
-   * <p>The "{rowName}_" is used as the nested row type name prefix in order to generate the right
+   * <p>The "{rowName}." is used as the nested row type name prefix in order to generate the right
    * schema. Nested record type that only differs with type name is still compatible.
    *
    * @param logicalType logical type
@@ -214,19 +247,36 @@ public class AvroSchemaConverter {
         // use long to represents Timestamp
         final TimestampType timestampType = (TimestampType) logicalType;
         precision = timestampType.getPrecision();
-        org.apache.avro.LogicalType avroLogicalType;
+        org.apache.avro.LogicalType timestampLogicalType;
         if (precision <= 3) {
-          avroLogicalType = LogicalTypes.timestampMillis();
+          timestampLogicalType = LogicalTypes.timestampMillis();
         } else if (precision <= 6) {
-          avroLogicalType = LogicalTypes.timestampMicros();
+          timestampLogicalType = LogicalTypes.timestampMicros();
         } else {
           throw new IllegalArgumentException(
               "Avro does not support TIMESTAMP type with precision: "
                   + precision
-                  + ", it only supports precision less than 6.");
+                  + ", it only support precisions <= 6.");
         }
-        Schema timestamp = avroLogicalType.addToSchema(SchemaBuilder.builder().longType());
+        Schema timestamp = timestampLogicalType.addToSchema(SchemaBuilder.builder().longType());
         return nullable ? nullableSchema(timestamp) : timestamp;
+      case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+        // use long to represents LocalZonedTimestampType
+        final LocalZonedTimestampType localZonedTimestampType = (LocalZonedTimestampType) logicalType;
+        precision = localZonedTimestampType.getPrecision();
+        org.apache.avro.LogicalType localZonedTimestampLogicalType;
+        if (precision <= 3) {
+          localZonedTimestampLogicalType = LogicalTypes.localTimestampMillis();
+        } else if (precision <= 6) {
+          localZonedTimestampLogicalType = LogicalTypes.localTimestampMicros();
+        } else {
+          throw new IllegalArgumentException(
+              "Avro does not support LOCAL TIMESTAMP type with precision: "
+                  + precision
+                  + ", it only support precisions <= 6.");
+        }
+        Schema localZonedTimestamp = localZonedTimestampLogicalType.addToSchema(SchemaBuilder.builder().longType());
+        return nullable ? nullableSchema(localZonedTimestamp) : localZonedTimestamp;
       case DATE:
         // use int to represents Date
         Schema date = LogicalTypes.date().addToSchema(SchemaBuilder.builder().intType());
@@ -245,10 +295,13 @@ public class AvroSchemaConverter {
         return nullable ? nullableSchema(time) : time;
       case DECIMAL:
         DecimalType decimalType = (DecimalType) logicalType;
-        // store BigDecimal as byte[]
+        // store BigDecimal as Fixed
+        // for spark compatibility.
         Schema decimal =
             LogicalTypes.decimal(decimalType.getPrecision(), decimalType.getScale())
-                .addToSchema(SchemaBuilder.builder().bytesType());
+                .addToSchema(SchemaBuilder
+                    .fixed(String.format("%s.fixed", rowName))
+                    .size(computeMinBytesForDecimalPrecision(decimalType.getPrecision())));
         return nullable ? nullableSchema(decimal) : decimal;
       case ROW:
         RowType rowType = (RowType) logicalType;
@@ -261,7 +314,7 @@ public class AvroSchemaConverter {
           LogicalType fieldType = rowType.getTypeAt(i);
           SchemaBuilder.GenericDefault<Schema> fieldBuilder =
               builder.name(fieldName)
-                  .type(convertToSchema(fieldType, rowName + "_" + fieldName));
+                  .type(convertToSchema(fieldType, rowName + "." + fieldName));
 
           if (fieldType.isNullable()) {
             builder = fieldBuilder.withDefault(null);
@@ -288,7 +341,6 @@ public class AvroSchemaConverter {
                 .items(convertToSchema(arrayType.getElementType(), rowName));
         return nullable ? nullableSchema(array) : array;
       case RAW:
-      case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
       default:
         throw new UnsupportedOperationException(
             "Unsupported to derive Schema for type: " + logicalType);
@@ -307,7 +359,7 @@ public class AvroSchemaConverter {
       keyType = multisetType.getElementType();
       valueType = new IntType();
     }
-    if (!LogicalTypeChecks.hasFamily(keyType, LogicalTypeFamily.CHARACTER_STRING)) {
+    if (!DataTypeUtils.isFamily(keyType, LogicalTypeFamily.CHARACTER_STRING)) {
       throw new UnsupportedOperationException(
           "Avro format doesn't support non-string as key type of map. "
               + "The key type is: "
@@ -323,6 +375,14 @@ public class AvroSchemaConverter {
     return schema.isNullable()
         ? schema
         : Schema.createUnion(SchemaBuilder.builder().nullType(), schema);
+  }
+
+  private static int computeMinBytesForDecimalPrecision(int precision) {
+    int numBytes = 1;
+    while (Math.pow(2.0, 8 * numBytes - 1) < Math.pow(10.0, precision)) {
+      numBytes += 1;
+    }
+    return numBytes;
   }
 }
 

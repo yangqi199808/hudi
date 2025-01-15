@@ -120,6 +120,19 @@
             "HoodieCommitMetadata"
          ],
          "default": null
+      },
+      {
+         "name":"hoodieIndexCommitMetadata",
+         "type":[
+            "null",
+            "HoodieIndexCommitMetadata"
+         ],
+         "default": null
+      },
+      {
+         "name":"stateTransitionTime",
+         "type":["null","string"],
+         "default": null
       }
    ]
 }

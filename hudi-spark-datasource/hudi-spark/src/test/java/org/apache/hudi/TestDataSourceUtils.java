@@ -21,16 +21,19 @@ package org.apache.hudi;
 import org.apache.hudi.avro.HoodieAvroUtils;
 import org.apache.hudi.client.SparkRDDWriteClient;
 import org.apache.hudi.common.config.TypedProperties;
+import org.apache.hudi.common.model.DefaultHoodieRecordPayload;
+import org.apache.hudi.common.model.HoodieColumnRangeMetadata;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieRecordPayload;
 import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.common.util.Option;
+import org.apache.hudi.common.util.SerializationUtils;
 import org.apache.hudi.common.util.collection.ImmutablePair;
 import org.apache.hudi.config.HoodieClusteringConfig;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.execution.bulkinsert.RDDCustomColumnsSortPartitioner;
-import org.apache.hudi.hive.HiveSyncConfig;
+import org.apache.hudi.metadata.HoodieMetadataPayload;
 import org.apache.hudi.table.BulkInsertPartitioner;
 
 import org.apache.avro.Conversions;
@@ -39,45 +42,32 @@ import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericFixed;
 import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.generic.IndexedRecord;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
-import org.apache.spark.sql.types.DecimalType$;
-import org.apache.spark.sql.types.Metadata;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
-import org.apache.spark.sql.types.StructType$;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
-import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Captor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 
-import static org.apache.hudi.DataSourceUtils.mayBeOverwriteParquetWriteLegacyFormatProp;
-import static org.apache.hudi.common.model.HoodieFileFormat.PARQUET;
-import static org.apache.hudi.hive.ddl.HiveSyncMode.HMS;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.times;
@@ -86,9 +76,6 @@ import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
 public class TestDataSourceUtils {
-
-  private static final String HIVE_DATABASE = "testdb1";
-  private static final String HIVE_TABLE = "hive_trips";
 
   @Mock
   private SparkRDDWriteClient hoodieWriteClient;
@@ -160,7 +147,7 @@ public class TestDataSourceUtils {
     when(hoodieWriteClient.getConfig()).thenReturn(config);
 
     DataSourceUtils.doWriteOperation(hoodieWriteClient, hoodieRecords, "test-time",
-            WriteOperationType.BULK_INSERT);
+            WriteOperationType.BULK_INSERT, false);
 
     verify(hoodieWriteClient, times(1)).bulkInsert(any(hoodieRecords.getClass()), anyString(),
             optionCaptor.capture());
@@ -173,7 +160,7 @@ public class TestDataSourceUtils {
 
     Exception exception = assertThrows(HoodieException.class, () -> {
       DataSourceUtils.doWriteOperation(hoodieWriteClient, hoodieRecords, "test-time",
-              WriteOperationType.BULK_INSERT);
+              WriteOperationType.BULK_INSERT, false);
     });
 
     assertThat(exception.getMessage(), containsString("Could not create UserDefinedBulkInsertPartitioner"));
@@ -184,7 +171,7 @@ public class TestDataSourceUtils {
     setAndVerifyHoodieWriteClientWith(NoOpBulkInsertPartitioner.class.getName());
 
     DataSourceUtils.doWriteOperation(hoodieWriteClient, hoodieRecords, "test-time",
-            WriteOperationType.BULK_INSERT);
+            WriteOperationType.BULK_INSERT, false);
 
     verify(hoodieWriteClient, times(1)).bulkInsert(any(hoodieRecords.getClass()), anyString(),
         optionCaptor.capture());
@@ -216,7 +203,7 @@ public class TestDataSourceUtils {
             .newBuilder()
             .withPath("/")
             .withUserDefinedBulkInsertPartitionerClass(RDDCustomColumnsSortPartitioner.class.getName())
-            .withUserDefinedBulkInsertPartitionerSortColumns("column1, column2")
+            .withUserDefinedBulkInsertPartitionerSortColumns("column1,column2")
             .withSchema(avroSchemaString)
             .build();
 
@@ -235,8 +222,7 @@ public class TestDataSourceUtils {
     asyncClusteringKeyValues.stream().forEach(pair -> {
       HashMap<String, String> params = new HashMap<>(3);
       params.put(DataSourceWriteOptions.TABLE_TYPE().key(), DataSourceWriteOptions.TABLE_TYPE().defaultValue());
-      params.put(DataSourceWriteOptions.PAYLOAD_CLASS_NAME().key(),
-              DataSourceWriteOptions.PAYLOAD_CLASS_NAME().defaultValue());
+      params.put(DataSourceWriteOptions.PAYLOAD_CLASS_NAME().key(), DefaultHoodieRecordPayload.class.getName());
       params.put(pair.left, pair.right.toString());
       HoodieWriteConfig hoodieConfig = DataSourceUtils
               .createHoodieConfig(avroSchemaString, config.getBasePath(), "test", params);
@@ -246,29 +232,6 @@ public class TestDataSourceUtils {
       prop.putAll(params);
       assertEquals(pair.right, HoodieClusteringConfig.from(prop).isAsyncClusteringEnabled());
     });
-  }
-
-  @ParameterizedTest
-  @ValueSource(booleans = {true, false})
-  public void testBuildHiveSyncConfig(boolean useSyncMode) {
-    TypedProperties props = new TypedProperties();
-    if (useSyncMode) {
-      props.setProperty(DataSourceWriteOptions.HIVE_SYNC_MODE().key(), HMS.name());
-      props.setProperty(DataSourceWriteOptions.HIVE_USE_JDBC().key(), String.valueOf(false));
-    }
-    props.setProperty(DataSourceWriteOptions.HIVE_DATABASE().key(), HIVE_DATABASE);
-    props.setProperty(DataSourceWriteOptions.HIVE_TABLE().key(), HIVE_TABLE);
-    HiveSyncConfig hiveSyncConfig = DataSourceUtils.buildHiveSyncConfig(props, config.getBasePath(), PARQUET.name());
-
-    if (useSyncMode) {
-      assertFalse(hiveSyncConfig.useJdbc);
-      assertEquals(HMS.name(), hiveSyncConfig.syncMode);
-    } else {
-      assertTrue(hiveSyncConfig.useJdbc);
-      assertNull(hiveSyncConfig.syncMode);
-    }
-    assertEquals(HIVE_DATABASE, hiveSyncConfig.databaseName);
-    assertEquals(HIVE_TABLE, hiveSyncConfig.tableName);
   }
 
   private void setAndVerifyHoodieWriteClientWith(final String partitionerClassName) {
@@ -283,7 +246,8 @@ public class TestDataSourceUtils {
   public static class NoOpBulkInsertPartitioner<T extends HoodieRecordPayload>
       implements BulkInsertPartitioner<JavaRDD<HoodieRecord<T>>> {
 
-    public NoOpBulkInsertPartitioner(HoodieWriteConfig config) {}
+    public NoOpBulkInsertPartitioner(HoodieWriteConfig config) {
+    }
 
     @Override
     public JavaRDD<HoodieRecord<T>> repartitionRecords(JavaRDD<HoodieRecord<T>> records, int outputSparkPartitions) {
@@ -299,7 +263,8 @@ public class TestDataSourceUtils {
   public static class NoOpBulkInsertPartitionerRows
       implements BulkInsertPartitioner<Dataset<Row>> {
 
-    public NoOpBulkInsertPartitionerRows(HoodieWriteConfig config) {}
+    public NoOpBulkInsertPartitionerRows(HoodieWriteConfig config) {
+    }
 
     @Override
     public Dataset<Row> repartitionRecords(Dataset<Row> records, int outputSparkPartitions) {
@@ -312,32 +277,27 @@ public class TestDataSourceUtils {
     }
   }
 
-  @ParameterizedTest
-  @CsvSource({"true, false", "true, true", "false, true", "false, false"})
-  public void testAutoModifyParquetWriteLegacyFormatParameter(boolean smallDecimal, boolean defaultWriteValue) {
-    // create test StructType
-    List<StructField> structFields = new ArrayList<>();
-    if (smallDecimal) {
-      structFields.add(StructField.apply("d1", DecimalType$.MODULE$.apply(10, 2), false, Metadata.empty()));
-    } else {
-      structFields.add(StructField.apply("d1", DecimalType$.MODULE$.apply(38, 10), false, Metadata.empty()));
-    }
-    StructType structType = StructType$.MODULE$.apply(structFields);
-    // create write options
-    Map<String, String> options = new HashMap<>();
-    options.put("hoodie.parquet.writelegacyformat.enabled", String.valueOf(defaultWriteValue));
+  @Test
+  public void testSerHoodieMetadataPayload() throws IOException {
+    String partitionPath = "2022/10/01";
+    String fileName = "file.parquet";
+    String targetColName = "c1";
 
-    // start test
-    mayBeOverwriteParquetWriteLegacyFormatProp(options, structType);
+    HoodieColumnRangeMetadata<Comparable> columnStatsRecord =
+        HoodieColumnRangeMetadata.<Comparable>create(fileName, targetColName, 0, 500, 0, 100, 12345, 12345);
 
-    // check result
-    boolean res = Boolean.parseBoolean(options.get("hoodie.parquet.writelegacyformat.enabled"));
-    if (smallDecimal) {
-      // should auto modify "hoodie.parquet.writelegacyformat.enabled" = "true".
-      assertEquals(true, res);
-    } else {
-      // should not modify the value of "hoodie.parquet.writelegacyformat.enabled".
-      assertEquals(defaultWriteValue, res);
-    }
+    HoodieRecord<HoodieMetadataPayload> hoodieMetadataPayload =
+        HoodieMetadataPayload.createColumnStatsRecords(partitionPath, Collections.singletonList(columnStatsRecord), false)
+            .findFirst().get();
+
+    IndexedRecord record = hoodieMetadataPayload.getData().getInsertValue(null).get();
+    byte[] recordToBytes = HoodieAvroUtils.indexedRecordToBytes(record);
+    GenericRecord genericRecord = HoodieAvroUtils.bytesToAvro(recordToBytes, record.getSchema());
+
+    HoodieMetadataPayload genericRecordHoodieMetadataPayload = new HoodieMetadataPayload(Option.of(genericRecord));
+    byte[] bytes = SerializationUtils.serialize(genericRecordHoodieMetadataPayload);
+    HoodieMetadataPayload deserGenericRecordHoodieMetadataPayload = SerializationUtils.deserialize(bytes);
+
+    assertEquals(genericRecordHoodieMetadataPayload, deserGenericRecordHoodieMetadataPayload);
   }
 }
